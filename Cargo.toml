@@ -1,0 +1,30 @@
+[package]
+name = "viewfinder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/6E6B/viewfinder"
+description = "Unofficial native GNOME client for Instagram"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_7"] }
+webkit6 = "0.6"
+gstreamer = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "process", "io-util"] }
+async-channel = "2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tempfile = "3.27"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = true

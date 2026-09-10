@@ -1,0 +1,31 @@
+# Rust
+/debug/
+/target/
+**/*.rs.bk
+*.pdb
+
+# Meson
+/build/
+/builddir/
+/.build/
+
+# Flatpak
+/.flatpak-builder/
+/flatpak-build/
+*.flatpak
+
+# GLib
+/data/gschemas.compiled
+
+# Secrets
+.env
+.env.*
+session_cookies.json
+*.session
+
+# Editors / OS
+*~
+*.swp
+*.swo
+.idea/
+.DS_Store

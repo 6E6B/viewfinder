@@ -1,0 +1,53 @@
+.social-feed { background: transparent; }
+.social-feed > row { padding: 0; background: transparent; }
+.social-feed > row:hover { background: transparent; }
+.post-card { padding: 12px; }
+.post-media { padding: 0; border: 0; background: transparent; box-shadow: none; border-radius: 8px; }
+.reel-surface { background: #151515; border-radius: 12px; }
+.message-list { padding: 16px 0; }
+.message-bubble { background: var(--card-bg-color); border-radius: 20px; padding: 8px 12px; }
+.message-bubble.outgoing { background: var(--accent-bg-color); color: var(--accent-fg-color); }
+.message-bubble.join-previous { border-top-left-radius: 5px; }
+.message-bubble.join-next { border-bottom-left-radius: 5px; }
+.message-bubble.outgoing.join-previous { border-top-left-radius: 20px; border-top-right-radius: 5px; }
+.message-bubble.outgoing.join-next { border-bottom-left-radius: 20px; border-bottom-right-radius: 5px; }
+.conversation-list > row:selected { background: alpha(var(--window-fg-color), 0.10); }
+.conversation-list > row:selected:hover { background: alpha(var(--window-fg-color), 0.15); }
+.message-composer { background: var(--window-bg-color); border-top: 1px solid var(--border-color); }
+.message-entry { min-height: 42px; border-radius: 22px; padding: 0 16px; }
+
+.post-actions { margin-top: 2px; }
+.engagement-button { padding: 6px 8px; border-radius: 8px; }
+.engagement-button image { -gtk-icon-size: 22px; }
+.engagement-button.liked { color: var(--red-3); }
+.reel-actions .engagement-button { padding: 6px 10px; min-height: 28px; }
+.reel-actions label { font-size: 0.85em; }
+.reel-details { padding: 0; }
+ .reel-caption-overlay {
+  padding: 48px 16px 16px;
+  color: white;
+  background: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.75));
+}
+.reel-caption-overlay > button, .reel-caption-overlay > menubutton > button { color: white; }
+.reel-caption-overlay popover { color: var(--popover-fg-color); }
+.reel-navigation { padding: 4px; }
+.caption-expander { padding: 0; min-height: 20px; }
+
+.profile-card { padding: 16px; }
+.profile-card .title-2 { margin-bottom: 2px; }
+.discovery-list { background: transparent; }
+.discovery-list > row { padding: 0; margin: 2px 2px 8px; border-radius: 12px; }
+.discovery-row { padding: 12px; min-height: 40px; }
+.discovery-grid > child { padding: 4px; }
+.discovery-grid > child > overlay { border-radius: 8px; }
+.story-tray { padding: 4px 16px 12px; }
+.story-person { padding: 4px; border-radius: 12px; }
+.story-ring { padding: 3px; border-radius: 999px; }
+.story-ring.unseen { background-image: linear-gradient(35deg, #ffcf55, #fa3c69, #b735cf); }
+.story-ring.seen { background-color: alpha(currentColor, 0.25); }
+.story-ring avatar { border: 3px solid @window_bg_color; border-radius: 999px; }
+.story-progress { margin: 8px 12px; }
+.story-segment { min-height: 4px; border-radius: 2px; background: alpha(currentColor, 0.2); }
+.story-segment.complete { background: currentColor; }
+
+.message-divider { margin: 20px 24px 14px; font-size: 0.85em; opacity: 0.6; }

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="sunset-s4" x1="10%" y1="90%" x2="90%" y2="10%">
+      <stop offset="0%" stop-color="#f8e45c"/>
+      <stop offset="25%" stop-color="#ffa348"/>
+      <stop offset="50%" stop-color="#ed333b"/>
+      <stop offset="75%" stop-color="#c061cb"/>
+      <stop offset="100%" stop-color="#3584e4"/>
+    </linearGradient>
+
+    <linearGradient id="curved-shine-silv" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.32"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.0"/>
+    </linearGradient>
+
+    <clipPath id="window-clip-4">
+      <rect x="27" y="29" width="74" height="70" rx="9"/>
+    </clipPath>
+  </defs>
+
+  <g transform="translate(64 64) scale(1.12) translate(-64 -64)">
+    <!-- Baseplate & Silver Chassis (No bar on top) -->
+    <rect x="14" y="16" width="100" height="100" rx="20" fill="#c0bfbc"/>
+    <rect x="14" y="16" width="100" height="96" rx="20" fill="#deddda"/>
+
+    <!-- Optical Frame -->
+    <rect x="22" y="24" width="84" height="80" rx="14" fill="#181424"/>
+    <rect x="24" y="26" width="80" height="76" rx="12" fill="#241f31"/>
+
+    <!-- Sunset Screen -->
+    <rect x="27" y="29" width="74" height="70" rx="9" fill="url(#sunset-s4)"/>
+
+    <!-- Curved Glass Arc Shine -->
+    <g clip-path="url(#window-clip-4)">
+      <path d="M 27 29 L 101 29 L 101 48 C 80 58 45 56 27 42 Z" fill="url(#curved-shine-silv)"/>
+      <path d="M 27 29.5 L 101 29.5" stroke="#ffffff" stroke-width="1" stroke-opacity="0.35"/>
+    </g>
+
+    <!-- Bright-Line Reticles -->
+    <path d="M 40 46 L 40 39 L 47 39 M 81 39 L 88 39 L 88 46 M 40 82 L 40 89 L 47 89 M 81 89 L 88 89 L 88 82"
+          stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+    <path d="M 59 64 L 69 64 M 64 59 L 64 69" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  </g>
+</svg>

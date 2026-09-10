@@ -1,0 +1,17 @@
+{
+  "edges": [
+    {"node": {"media_or_ad": {
+      "pk": "9001", "code": "fixtureA", "user": {"pk": 101, "username": "fixture_user"},
+      "like_count": 0, "caption": {"text": "Carousel"},
+      "carousel_media": [
+        {"image_versions2": {"candidates": [{"width": 320, "url": "https://example.invalid/thumb.jpg"}, {"width": 1080, "url": "https://example.invalid/photo.jpg"}]}},
+        {"video_versions": [{"url": "https://example.invalid/video.mp4"}]}
+      ]
+    }}},
+    {"node": {"id": "9002", "shortcode": "fixtureB", "owner": {"id": "101", "username": "fixture_user"},
+      "display_url": "https://example.invalid/photo.jpg", "edge_liked_by": {"count": 3},
+      "edge_media_to_caption": {"edges": [{"node": {"text": "Fixture caption"}}]}
+    }}
+  ],
+  "page_info": {"has_next_page": true, "end_cursor": "opaque-cursor"}
+}

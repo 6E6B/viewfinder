@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=io.github._6E6B.viewfinder
+Exec=@bindir@/viewfinder --gapplication-service

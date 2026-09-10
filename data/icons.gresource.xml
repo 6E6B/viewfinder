@@ -1,0 +1,7 @@
+<gresources>
+  <gresource prefix="/io/github/_6E6B/viewfinder/icons/scalable/actions">
+    <file alias="viewfinder-heart-symbolic.svg">icons/heart-symbolic.svg</file>
+    <file alias="viewfinder-heart-filled-symbolic.svg">icons/heart-filled-symbolic.svg</file>
+    <file alias="viewfinder-comment-symbolic.svg">icons/comment-symbolic.svg</file>
+  </gresource>
+</gresources>

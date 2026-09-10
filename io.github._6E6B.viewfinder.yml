@@ -1,0 +1,44 @@
+id: io.github._6E6B.viewfinder
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: viewfinder
+finish-args:
+  # Shared memory for GTK and video
+  - --share=ipc
+  # Sign-in, API, and media
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  # Reels and in-feed video audio
+  - --socket=pulseaudio
+  # GTK 4 rendering and video playback
+  - --device=dri
+  # Optional session persistence via secret-tool
+  - --talk-name=org.freedesktop.secrets
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /man
+  - /share/doc
+  - /share/gtk-doc
+  - /share/man
+  - /share/pkgconfig
+  - '*.la'
+  - '*.a'
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/viewfinder/cargo
+    CARGO_NET_OFFLINE: 'false'
+modules:
+  - name: viewfinder
+    buildsystem: meson
+    build-options:
+      build-args:
+        - --share=network
+    sources:
+      - type: dir
+        path: .

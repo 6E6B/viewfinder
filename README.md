@@ -4,7 +4,7 @@
 
 # Viewfinder
 
-Viewfinder is a program for the GNOME desktop. Viewfinder is an unofficial Instagram client.
+Viewfinder is an unofficial third-party Instagram client for the GNOME desktop.
 
 </div>
 

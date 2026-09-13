@@ -1,3 +1,5 @@
+# Local development manifest (directory sources).
+# For Flathub, replace the dir source with a tagged git commit and keep cargo-sources.json.
 id: io.github._6E6B.viewfinder
 runtime: org.gnome.Platform
 runtime-version: '50'
@@ -6,17 +8,12 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 command: viewfinder
 finish-args:
-  # Shared memory for GTK and video
   - --share=ipc
-  # Sign-in, API, and media
   - --share=network
   - --socket=fallback-x11
   - --socket=wayland
-  # Reels and in-feed video audio
   - --socket=pulseaudio
-  # GTK 4 rendering and video playback
   - --device=dri
-  # Optional session persistence via secret-tool
   - --talk-name=org.freedesktop.secrets
 cleanup:
   - /include
@@ -32,13 +29,17 @@ build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
     CARGO_HOME: /run/build/viewfinder/cargo
-    CARGO_NET_OFFLINE: 'false'
+    CARGO_NET_OFFLINE: 'true'
 modules:
   - name: viewfinder
     buildsystem: meson
-    build-options:
-      build-args:
-        - --share=network
+    config-opts:
+      - --buildtype=release
     sources:
       - type: dir
         path: .
+      - flatpak/cargo-sources.json
+      - type: shell
+        commands:
+          - mkdir -p .cargo
+          - cp -f cargo/config .cargo/config.toml

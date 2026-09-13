@@ -29,3 +29,7 @@ session_cookies.json
 *.swo
 .idea/
 .DS_Store
+
+# Flatpak cargo generator
+flatpak/.generator-venv/
+flatpak/flatpak-cargo-generator.py

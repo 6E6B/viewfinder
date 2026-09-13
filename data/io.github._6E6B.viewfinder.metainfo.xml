@@ -5,13 +5,14 @@
   <project_license>GPL-3.0-or-later</project_license>
   <name>Viewfinder</name>
   <summary>Browse photos and conversations</summary>
-  <developer id="io.github._6e6b">
+  <developer id="io.github._6E6B">
     <name>Nick</name>
   </developer>
   <description>
     <p>
-      Viewfinder is an independent native GNOME client for browsing photos,
-      Reels, Stories, and conversations. It is not affiliated with Meta.
+      Viewfinder is an independent native desktop client for browsing photos,
+      short videos, stories, and conversations from a popular photo-sharing
+      service. It is not affiliated with Meta Platforms, Inc.
     </p>
     <p>You can:</p>
     <ul>
@@ -31,6 +32,20 @@
     <color type="primary" scheme_preference="light">#ed333b</color>
     <color type="primary" scheme_preference="dark">#241f31</color>
   </branding>
+  <screenshots>
+    <screenshot type="default">
+      <caption>A profile in Viewfinder</caption>
+      <image>https://raw.githubusercontent.com/6E6B/viewfinder/v0.1.0/profile.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Reels in Viewfinder</caption>
+      <image>https://raw.githubusercontent.com/6E6B/viewfinder/v0.1.0/reels.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
   <content_rating type="oars-1.1">
     <content_attribute id="social-chat">intense</content_attribute>
     <content_attribute id="social-info">intense</content_attribute>

@@ -33,10 +33,13 @@ cargo run
 
 ## Flatpak
 
-Viewfinder can be built and installed as a Flatpak from this repository. The sandbox has network access for sign-in and media, and it stores the session with the system keyring.
+Viewfinder can be built and installed as a Flatpak from this repository. The sandbox has network access for sign-in and media, and it stores the session with the system keyring. Cargo dependencies are vendored for offline builds.
 
 ```sh
-flatpak-builder --user --install --force-clean --install-deps-from=flathub \
+flatpak install --user flathub org.gnome.Platform//50 org.gnome.Sdk//50 \
+  org.freedesktop.Sdk.Extension.rust-stable//25.08
+./flatpak/update-cargo-sources.sh
+flatpak-builder --user --install --force-clean \
   flatpak-build io.github._6E6B.viewfinder.yml
 flatpak run io.github._6E6B.viewfinder
 ```

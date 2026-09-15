@@ -8,6 +8,7 @@ mod imp {
     pub struct MediaFrame {
         pub child: RefCell<Option<gtk::Widget>>,
         pub ratio: Cell<f64>,
+        pub max_width: Cell<i32>,
     }
     #[glib::object_subclass]
     impl ObjectSubclass for MediaFrame {
@@ -28,9 +29,15 @@ mod imp {
         }
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             if orientation == gtk::Orientation::Horizontal {
-                (0, 640, -1, -1)
+                let max = self.max_width.get();
+                (0, if max > 0 { max.min(640) } else { 640 }, -1, -1)
             } else {
-                let height = (for_size.max(1) as f64 / self.ratio.get().max(0.1)).round() as i32;
+                // Boxes ask for height at the full row width, but the child is
+                // only ever allocated up to its natural width — reporting height
+                // for more than that reserves dead space under the media.
+                let max = self.max_width.get();
+                let width = if max > 0 { for_size.min(max) } else { for_size };
+                let height = (width.max(1) as f64 / self.ratio.get().max(0.1)).round() as i32;
                 (height.min(520), height.min(520), -1, -1)
             }
         }
@@ -57,5 +64,15 @@ impl MediaFrame {
         child.set_parent(&frame);
         frame.imp().child.replace(Some(child.clone().upcast()));
         frame
+    }
+    /// Cap the natural width so the surface stays compact in message rows.
+    pub fn set_max_width(&self, width: i32) {
+        self.imp().max_width.set(width);
+    }
+    /// Update the reserved aspect ratio — e.g. once the decoded image's true
+    /// dimensions are known — and renegotiate size.
+    pub fn set_ratio(&self, ratio: f64) {
+        self.imp().ratio.set(ratio);
+        self.queue_resize();
     }
 }

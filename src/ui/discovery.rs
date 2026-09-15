@@ -11,14 +11,20 @@ pub(super) fn heading(collection: &Rc<Collection>, route: &Route) -> adw::Clamp 
     body.set_margin_end(16);
     body.set_margin_top(20);
     body.set_margin_bottom(16);
-    let title = label(if matches!(route, Route::Notifications) {
-        "Your activity"
-    } else {
-        "Find something new"
-    });
-    title.add_css_class("title-1");
-    body.append(&title);
+    if let Route::Followers(user, following) = route {
+        let title = label(if *following { "Following" } else { "Followers" });
+        title.add_css_class("title-1");
+        body.append(&title);
+        if !user.username.is_empty() {
+            let context = label(&format!("@{}", user.username));
+            context.add_css_class("dim-label");
+            body.append(&context);
+        }
+    }
     if let Route::Search(query) | Route::Keyword(query) = route {
+        let title = label("Find something new");
+        title.add_css_class("title-1");
+        body.append(&title);
         let entry = gtk::SearchEntry::builder()
             .placeholder_text("Search Viewfinder")
             .text(query)

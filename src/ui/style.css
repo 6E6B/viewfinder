@@ -43,7 +43,7 @@
 .story-tray { padding: 4px 16px 12px; }
 .story-person { padding: 4px; border-radius: 12px; }
 .story-ring { padding: 3px; border-radius: 999px; }
-.story-ring.unseen { background-image: linear-gradient(35deg, #ffcf55, #fa3c69, #b735cf); }
+.story-ring.unseen { background-color: var(--accent-bg-color); }
 .story-ring.seen { background-color: alpha(currentColor, 0.25); }
 .story-ring avatar { border: 3px solid @window_bg_color; border-radius: 999px; }
 .story-progress { margin: 8px 12px; }
@@ -51,3 +51,54 @@
 .story-segment.complete { background: currentColor; }
 
 .message-divider { margin: 20px 24px 14px; font-size: 0.85em; opacity: 0.6; }
+
+/* Media, shared posts and stickers render as the surface itself — no tinted
+   bubble around them, matching Direct. */
+.message-bubble.transparent { background: transparent; padding: 0; box-shadow: none; }
+.message-bubble.outgoing.transparent { background: transparent; }
+.message-bubble.transparent .caption-heading { margin: 6px 8px 0; }
+.message-media { padding: 0; border: 0; background: transparent; box-shadow: none; border-radius: 16px; }
+
+/* Shared posts render as a plain card. */
+.post-share { border-radius: 16px; }
+.post-share-author { padding: 8px 10px; box-shadow: none; }
+.post-share-media { padding: 0; border: 0; background: transparent; box-shadow: none; }
+.post-share-footer { padding: 8px 10px; }
+
+/* Replies quote the original above the text. */
+.message-quote { padding: 6px 10px; margin-bottom: 2px; border-radius: 12px; background: alpha(currentColor, 0.08); box-shadow: none; }
+.message-quote:hover { background: alpha(currentColor, 0.15); }
+.quote-thumbnail { border-radius: 6px; }
+
+/* Playable video surfaces carry a translucent circular badge. */
+.video-badge { background: alpha(black, 0.55); color: white; border-radius: 999px; padding: 14px; }
+button.video-badge:hover { background: alpha(black, 0.7); }
+button.video-badge:active { background: alpha(black, 0.75); }
+.video-badge image, image.video-badge { -gtk-icon-size: 22px; }
+
+/* Reaction chips hang off the bubble's lower corner. Text bubbles reserve
+   bottom padding so the chip lands on padding instead of covering the text. */
+.message-bubble.has-reactions { padding-bottom: 16px; }
+.message-bubble.transparent.has-reactions { padding-bottom: 0; }
+.message-reactions { padding: 2px 9px; min-height: 0; border-radius: 999px; background: var(--window-bg-color); border: 1px solid var(--border-color); box-shadow: 0 1px 4px alpha(black, 0.18); font-size: 0.9em; }
+.message-reactions.own { border-color: alpha(var(--accent-bg-color), 0.7); }
+.quick-reactions .reaction-option { padding: 4px 6px; min-height: 0; border-radius: 8px; font-size: 1.25em; }
+.quick-reactions .reaction-option.active { background: alpha(var(--accent-bg-color), 0.18); }
+.message-menu-action { padding: 8px 10px; border-radius: 8px; }
+
+/* Stickers and GIFs float without a bubble. */
+.message-sticker { background: transparent; }
+.sticker-cell { padding: 4px; border-radius: 10px; }
+
+/* Link previews keep the bubble tint. */
+.link-card { padding: 8px 10px; border-radius: 12px; background: alpha(currentColor, 0.07); box-shadow: none; }
+.link-card:hover { background: alpha(currentColor, 0.12); }
+.link-card-image { border-radius: 8px; }
+
+/* Voice messages: play button, waveform bars and duration inside the bubble. */
+.voice-card { min-width: 180px; }
+.voice-card > button { min-width: 36px; min-height: 36px; background: alpha(currentColor, 0.15); color: inherit; box-shadow: none; }
+.voice-card > button:hover { background: alpha(currentColor, 0.25); }
+
+/* The reply bar above the composer. */
+.reply-bar { padding: 6px 12px; margin-top: 8px; border-radius: 10px; background: alpha(var(--view-fg-color), 0.05); }

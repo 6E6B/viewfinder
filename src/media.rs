@@ -51,7 +51,7 @@ impl Images {
                 .expect("media HTTP client"),
             cache: Mutex::new(VecDeque::new()),
             slots: tokio::sync::Semaphore::new(6),
-            avatar_slots: tokio::sync::Semaphore::new(2),
+            avatar_slots: tokio::sync::Semaphore::new(4),
             requests: Mutex::new(HashMap::new()),
         })
     }
@@ -209,6 +209,24 @@ impl Images {
         }
         Ok(pixels)
     }
+    /// Fill the cache in the background. `size` must match the eventual
+    /// `get()` call; identical keys share the in-flight request lock, so a
+    /// row that maps mid-download joins this request rather than repeating it.
+    pub fn prefetch(self: &Arc<Self>, url: Option<String>, size: i32) {
+        let Some(url) = url else { return };
+        let images = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = images.get(url, size).await;
+        });
+    }
+    /// Cache-fill matching the `avatar()` request key.
+    pub fn prefetch_avatar(self: &Arc<Self>, user: &crate::domain::User, size: i32) {
+        self.prefetch(user.avatar.clone(), size * 2);
+    }
+    /// Cache-fill matching the `preview()`/`picture()` request key.
+    pub fn prefetch_media(self: &Arc<Self>, media: &crate::domain::Media, size: i32) {
+        self.prefetch(preview_url(media, size), size);
+    }
 }
 pub fn validate_media_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "invalid URL")?;
@@ -217,6 +235,7 @@ pub fn validate_media_url(url: &str) -> Result<(), String> {
         || ![
             "cdninstagram.com",
             "fbcdn.net",
+            "fbsbx.com",
             "instagram.com",
             "giphy.com",
             "tenor.com",
@@ -280,7 +299,11 @@ pub fn picture(images: Arc<Images>, url: Option<String>, size: i32) -> gtk::Pict
         task,
         move |p| {
             generation.set(generation.get() + 1);
-            task.borrow_mut().take();
+            // Let an in-flight download land in the shared cache; a remap
+            // resolves from cache instead of restarting the request.
+            if let Some(task) = task.borrow_mut().take() {
+                task.detach();
+            }
             p.set_paintable(None::<&gdk::Paintable>);
         }
     ));
@@ -372,7 +395,9 @@ pub fn avatar(images: Arc<Images>, user: &crate::domain::User, size: i32) -> adw
         }
     ));
     avatar.connect_unmap(move |avatar| {
-        task.borrow_mut().take();
+        if let Some(task) = task.borrow_mut().take() {
+            task.detach();
+        }
         avatar.set_custom_image(None::<&gdk::Paintable>);
     });
     avatar
@@ -476,6 +501,18 @@ impl Playback {
     }
     pub fn owns(&self, picture: &gtk::Picture) -> bool {
         self.active_picture.upgrade().as_ref() == Some(picture)
+    }
+    /// Stop only when the active video surface sits inside `owner`. GTK maps
+    /// the incoming view before unmapping the outgoing one, so an unmap
+    /// handler must not kill a pipeline that another widget just started.
+    pub fn stop_owned(&self, owner: &impl IsA<gtk::Widget>) {
+        if self
+            .active_picture
+            .upgrade()
+            .is_some_and(|picture| picture.is_ancestor(owner))
+        {
+            self.stop();
+        }
     }
     pub fn stop(&self) {
         self.playing.set(false);
@@ -737,6 +774,7 @@ mod tests {
     fn media_hosts_are_validated_without_network() {
         assert!(validate_media_url("https://scontent.cdninstagram.com/image.jpg").is_ok());
         assert!(validate_media_url("https://media.giphy.com/media/example/giphy.mp4").is_ok());
+        assert!(validate_media_url("https://cdn.fbsbx.com/v/t59.2708-21/sticker.webp").is_ok());
         for url in [
             "https://giphy.com.evil.invalid/a",
             "http://scontent.cdninstagram.com/a",

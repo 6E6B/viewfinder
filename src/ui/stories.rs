@@ -8,6 +8,7 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
@@ -18,6 +19,13 @@ pub struct Tray {
     ui: Weak<Ui>,
     task: RefCell<Option<Task>>,
     loaded: Cell<bool>,
+    entries: RefCell<Vec<TrayEntry>>,
+}
+
+struct TrayEntry {
+    story: Story,
+    button: gtk::Button,
+    ring: gtk::Box,
 }
 
 impl Tray {
@@ -36,14 +44,29 @@ impl Tray {
             ui: Rc::downgrade(ui),
             task: RefCell::new(None),
             loaded: Cell::new(false),
+            entries: RefCell::new(vec![]),
         })
     }
 
     pub fn reset(&self) {
         self.task.borrow_mut().take();
         self.loaded.set(false);
+        self.entries.borrow_mut().clear();
         while let Some(child) = self.row.first_child() {
             self.row.remove(&child);
+        }
+    }
+
+    fn mark_seen(&self, story_id: &str) {
+        for entry in self.entries.borrow().iter() {
+            if entry.story.id == story_id {
+                entry.ring.remove_css_class("unseen");
+                entry.ring.add_css_class("seen");
+                entry.button.set_tooltip_text(Some(&format!(
+                    "{} · Seen stories",
+                    entry.story.author.username
+                )));
+            }
         }
     }
 
@@ -97,7 +120,8 @@ impl Tray {
         ));
     }
 
-    fn populate(&self, ui: &Rc<Ui>, page: Page) {
+    fn populate(self: &Rc<Self>, ui: &Rc<Ui>, page: Page) {
+        self.entries.borrow_mut().clear();
         let stories: Rc<Vec<Story>> = Rc::new(
             page.items
                 .into_iter()
@@ -137,13 +161,20 @@ impl Tray {
             name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             column.append(&name);
             button.set_child(Some(&column));
+            self.entries.borrow_mut().push(TrayEntry {
+                story: story.clone(),
+                button: button.clone(),
+                ring: ring.clone(),
+            });
             button.connect_clicked(glib::clone!(
                 #[weak]
                 ui,
+                #[weak(rename_to = tray)]
+                self,
                 #[strong]
                 stories,
                 move |_| {
-                    StoryViewer::present(&ui, stories.clone(), index);
+                    StoryViewer::present(&ui, Rc::downgrade(&tray), stories.clone(), index);
                 }
             ));
             self.row.append(&button);
@@ -162,11 +193,14 @@ impl Tray {
 
 struct StoryViewer {
     ui: Weak<Ui>,
+    tray: Weak<Tray>,
     stories: Rc<Vec<Story>>,
     friend: Cell<usize>,
     index: Cell<usize>,
     posts: RefCell<Vec<Post>>,
     task: RefCell<Option<Task>>,
+    marked: RefCell<HashSet<String>>,
+    seen_tasks: RefCell<Vec<Task>>,
     dialog: glib::WeakRef<adw::Dialog>,
     title: adw::WindowTitle,
     content: gtk::Box,
@@ -182,7 +216,7 @@ struct StoryViewer {
 }
 
 impl StoryViewer {
-    fn present(ui: &Rc<Ui>, stories: Rc<Vec<Story>>, index: usize) -> Rc<Self> {
+    fn present(ui: &Rc<Ui>, tray: Weak<Tray>, stories: Rc<Vec<Story>>, index: usize) -> Rc<Self> {
         let dialog = adw::Dialog::builder()
             .title("Stories")
             .content_width(480)
@@ -262,11 +296,14 @@ impl StoryViewer {
         dialog.set_child(Some(&toolbar));
         let viewer = Rc::new(Self {
             ui: Rc::downgrade(ui),
+            tray,
             stories,
             friend: Cell::new(index),
             index: Cell::new(0),
             posts: RefCell::new(vec![]),
             task: RefCell::new(None),
+            marked: RefCell::new(HashSet::new()),
+            seen_tasks: RefCell::new(vec![]),
             dialog: dialog.downgrade(),
             title,
             content,
@@ -345,6 +382,7 @@ impl StoryViewer {
         dialog.connect_closed(move |_| {
             let viewer = &keep_alive;
             viewer.task.borrow_mut().take();
+            viewer.seen_tasks.borrow_mut().clear();
             if let Some(ui) = viewer.ui.upgrade() {
                 ui.playback.stop();
             }
@@ -470,6 +508,7 @@ impl StoryViewer {
                 .set_label("No stories available. Continue to the next friend.");
             return;
         };
+        self.mark_seen(post);
         self.title.set_subtitle(&format!(
             "Story {} of {} · Friend {} of {}",
             self.index.get() + 1,
@@ -519,6 +558,38 @@ impl StoryViewer {
         } else {
             self.status.set_label("Story media unavailable");
         }
+    }
+
+    /// Report each story item to Viewfinder as it is displayed. The tray ring
+    /// turns seen once the newest item of a friend's reel is confirmed.
+    fn mark_seen(&self, post: &Post) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let Some(client) = ui.client.borrow().clone() else {
+            return;
+        };
+        if !self.marked.borrow_mut().insert(post.id.clone()) {
+            return;
+        }
+        let story = self.stories[self.friend.get()].clone();
+        let is_last = self.index.get() + 1 >= self.posts.borrow().len();
+        let story_id = story.id.clone();
+        let post = post.clone();
+        let tray = self.tray.clone();
+        self.seen_tasks.borrow_mut().push(app::background(
+            async move { client.mark_story_seen(&story, &post).await },
+            move |result| match result {
+                Ok(()) => {
+                    if is_last && let Some(tray) = tray.upgrade() {
+                        tray.mark_seen(&story_id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not mark the story as seen");
+                }
+            },
+        ));
     }
 
     fn step(self: &Rc<Self>, forward: bool) {
@@ -602,7 +673,7 @@ pub(super) fn review(ui: &Rc<Ui>) {
         },
         seen: false,
     }]);
-    let viewer = StoryViewer::present(ui, stories, 0);
+    let viewer = StoryViewer::present(ui, Weak::new(), stories, 0);
     viewer.title.set_title("a_friend_with_a_long_username");
     *viewer.posts.borrow_mut() = (0..15)
         .map(|index| Post {

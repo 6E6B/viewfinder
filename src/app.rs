@@ -6,11 +6,23 @@ use std::{collections::HashSet, future::Future, sync::Arc};
 
 /// Tokio owns all I/O. Only completion callbacks execute on GLib.
 /// Dropping a Task cancels the future, including an in-flight HTTP request.
-pub struct Task(tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>);
+pub struct Task(
+    Option<tokio::task::AbortHandle>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
 impl Drop for Task {
     fn drop(&mut self) {
         self.1.store(true, std::sync::atomic::Ordering::Release);
-        self.0.abort();
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+impl Task {
+    /// Suppress the completion callback but let the future finish, so shared
+    /// caches still receive results the abandoned widget triggered.
+    pub fn detach(mut self) {
+        self.0 = None;
     }
 }
 
@@ -32,7 +44,7 @@ pub fn background<T: Send + 'static>(
             done(result);
         }
     });
-    Task(task.abort_handle(), cancelled)
+    Task(Some(task.abort_handle()), cancelled)
 }
 
 #[derive(Default)]

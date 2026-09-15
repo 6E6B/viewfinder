@@ -1,4 +1,4 @@
-use super::{Ui, format, icon_button, label, viewer};
+use super::{Ui, format, icon_button, label, notifications_button, viewer};
 use crate::{
     app::{self, Pagination, Task},
     domain::*,
@@ -32,12 +32,22 @@ pub struct Collection {
     more: adw::Spinner,
     scrolled: gtk::ScrolledWindow,
     auto_failed: Cell<bool>,
+    stick_bottom: Cell<bool>,
     banner: adw::Banner,
     header: gtk::Box,
     split: RefCell<Option<adw::NavigationSplitView>>,
     thread: RefCell<Option<Rc<Collection>>>,
     reels: RefCell<Option<Rc<super::reels::Reels>>>,
     pub(super) stories: Option<Rc<super::stories::Tray>>,
+    // Popover hosts set this so activating a row closes the surface.
+    pub(super) dismiss: RefCell<Option<Box<dyn Fn()>>>,
+    // Thread composer state for replies, reactions and the sticker tray.
+    reply_to: RefCell<Option<Message>>,
+    reply_bar: RefCell<Option<gtk::Box>>,
+    composer_entry: RefCell<Option<gtk::Entry>>,
+    message_task: RefCell<Option<Task>>,
+    sticker_task: RefCell<Option<Task>>,
+    sticker_packs: RefCell<Option<Rc<Vec<StickerPack>>>>,
 }
 impl Collection {
     pub fn new(ui: &Rc<Ui>, route: Route) -> Rc<Self> {
@@ -73,6 +83,11 @@ impl Collection {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        if matches!(route, Route::Notifications) {
+            // In a popover the list hugs its rows instead of filling a page.
+            scrolled.set_propagate_natural_height(true);
+            scrolled.set_max_content_height(420);
+        }
         let more = adw::Spinner::new();
         more.set_size_request(18, 18);
         more.set_tooltip_text(Some("Loading more posts"));
@@ -103,12 +118,20 @@ impl Collection {
             more: more.clone(),
             scrolled: scrolled.clone(),
             auto_failed: Cell::new(false),
+            stick_bottom: Cell::new(false),
             banner,
             header: header.clone(),
             split: RefCell::new(None),
             thread: RefCell::new(None),
             reels: RefCell::new(None),
             stories: matches!(route, Route::Home).then(|| super::stories::Tray::new(ui)),
+            dismiss: RefCell::new(None),
+            reply_to: RefCell::new(None),
+            reply_bar: RefCell::new(None),
+            composer_entry: RefCell::new(None),
+            message_task: RefCell::new(None),
+            sticker_task: RefCell::new(None),
+            sticker_packs: RefCell::new(None),
         });
         factory.connect_bind(glib::clone!(
             #[weak]
@@ -121,12 +144,35 @@ impl Collection {
                     return;
                 };
                 let item = object.borrow::<Item>().clone();
+                if matches!(item, Item::FeedHeader) {
+                    li.set_activatable(false);
+                    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                    heading.set_margin_top(12);
+                    heading.set_margin_bottom(12);
+                    heading.set_margin_start(16);
+                    heading.set_margin_end(16);
+                    let title = label("Your feed");
+                    title.add_css_class("title-2");
+                    title.set_selectable(false);
+                    title.set_hexpand(true);
+                    heading.append(&title);
+                    column.append(&heading);
+                    if let Some(stories) = &c.stories {
+                        if stories.root.parent().is_some() {
+                            stories.root.unparent();
+                        }
+                        column.append(&stories.root);
+                    }
+                    li.set_child(Some(&column));
+                    return;
+                }
                 li.set_activatable(!matches!(
                     item,
                     Item::Message(_) | Item::Notification(Notification { user: None, .. })
                 ));
                 if let Some(ui) = c.ui.upgrade() {
-                    let mut child = render_item(&ui, &item, &c.route.borrow());
+                    let mut child = render_item(&ui, &item, &c.route.borrow(), &c);
                     if let Item::Message(message) = &item {
                         let sender = message.sender.clone();
                         let timestamp = message.timestamp;
@@ -152,26 +198,30 @@ impl Collection {
                             #[weak] divider,
                             #[upgrade_or] glib::ControlFlow::Break,
                             move |row, _| {
-                                let previous = li.position().checked_sub(1).and_then(|p| c.store.item(p))
-                                    .and_downcast::<glib::BoxedAnyObject>();
-                                let same_group = previous.is_some_and(|o| matches!(&*o.borrow::<Item>(), Item::Message(m) if format::same_message_group(m.timestamp, timestamp)));
+                                let neighbor = |position: Option<u32>| {
+                                    position
+                                        .and_then(|p| c.store.item(p))
+                                        .and_downcast::<glib::BoxedAnyObject>()
+                                };
+                                let joins = |o: &glib::BoxedAnyObject| {
+                                    matches!(&*o.borrow::<Item>(), Item::Message(m) if m.sender == sender && format::same_message_group(m.timestamp.min(timestamp), m.timestamp.max(timestamp)))
+                                };
+                                let previous = neighbor(li.position().checked_sub(1));
+                                let same_group = previous.as_ref().is_some_and(|o| matches!(&*o.borrow::<Item>(), Item::Message(m) if format::same_message_group(m.timestamp, timestamp)));
+                                let joins_previous = previous.as_ref().is_some_and(&joins);
+                                let joins_next = neighbor(li.position().checked_add(1))
+                                    .as_ref()
+                                    .is_some_and(joins);
                                 divider.set_visible(timestamp > 0 && !same_group);
-                                let mut widget = row.first_child();
-                                while let Some(bubble) = widget {
-                                    if bubble.has_css_class("message-bubble") {
-                                        for (position, class) in [
-                                            (li.position().checked_sub(1), "join-previous"),
-                                            (li.position().checked_add(1), "join-next"),
-                                        ] {
-                                            let joins = position.and_then(|p| c.store.item(p))
-                                                .and_downcast::<glib::BoxedAnyObject>()
-                                                .is_some_and(|o| matches!(&*o.borrow::<Item>(), Item::Message(m) if m.sender == sender && format::same_message_group(m.timestamp.min(timestamp), m.timestamp.max(timestamp))));
-                                            if joins { bubble.add_css_class(class); }
-                                            else { bubble.remove_css_class(class); }
-                                        }
-                                        break;
+                                row.set_margin_top(if same_group && !joins_previous { 8 } else { 1 });
+                                if let Some(bubble) = super::messages::bubble_of(row) {
+                                    for (joined, class) in [
+                                        (joins_previous, "join-previous"),
+                                        (joins_next, "join-next"),
+                                    ] {
+                                        if joined { bubble.add_css_class(class); }
+                                        else { bubble.remove_css_class(class); }
                                     }
-                                    widget = bubble.next_sibling();
                                 }
                                 glib::ControlFlow::Continue
                             }
@@ -256,7 +306,7 @@ impl Collection {
             }
             if matches!(
                 route,
-                Route::Notifications | Route::Search(_) | Route::Comments(_)
+                Route::Notifications | Route::Search(_) | Route::Comments(_) | Route::Followers(..)
             ) {
                 list.add_css_class("discovery-list");
                 list.set_margin_start(12);
@@ -324,40 +374,15 @@ impl Collection {
         }
         if matches!(
             route,
-            Route::Notifications | Route::Search(_) | Route::Keyword(_)
+            Route::Search(_) | Route::Keyword(_) | Route::Followers(..)
         ) {
             root.append(&super::discovery::heading(&c, &route));
-        }
-        if matches!(route, Route::Home) {
-            let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            heading.set_margin_top(12);
-            heading.set_margin_bottom(12);
-            heading.set_margin_start(16);
-            heading.set_margin_end(16);
-            let title = label("Your feed");
-            title.add_css_class("title-2");
-            title.set_selectable(false);
-            title.set_hexpand(true);
-            heading.append(&title);
-            root.append(
-                &adw::Clamp::builder()
-                    .maximum_size(600)
-                    .child(&heading)
-                    .build(),
-            );
-            if let Some(stories) = &c.stories {
-                root.append(
-                    &adw::Clamp::builder()
-                        .maximum_size(600)
-                        .child(&stories.root)
-                        .build(),
-                );
-            }
         }
         if matches!(route, Route::Inbox) {
             let bar = adw::HeaderBar::new();
             bar.set_title_widget(Some(&adw::WindowTitle::new("Messages", "")));
             bar.pack_start(&ui.sidebar_toggle());
+            bar.pack_end(&notifications_button(ui));
             let sidebar_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
             sidebar_content.append(&stack);
             sidebar_content.append(&more);
@@ -430,6 +455,7 @@ impl Collection {
             move |_| {
                 c.load_near_end();
                 c.mark_visible_read();
+                c.scroll_to_bottom();
             }
         ));
         root.connect_map(glib::clone!(
@@ -454,7 +480,7 @@ impl Collection {
                 c.more.set_visible(false);
                 p.generation += 1;
                 if let Some(ui) = c.ui.upgrade() {
-                    ui.playback.stop();
+                    ui.playback.stop_owned(&c.root);
                 }
             }
         ));
@@ -538,6 +564,326 @@ impl Collection {
             ),
         ));
     }
+    fn scroll_to_bottom(self: &Rc<Self>) {
+        let adjustment = self.scrolled.vadjustment();
+        if !self.stick_bottom.get() || adjustment.page_size() <= 0.0 || adjustment.upper() <= 0.0 {
+            return;
+        }
+        self.stick_bottom.set(false);
+        if self.store.n_items() > 0
+            && let Some(list) = self.list.borrow().as_ref()
+        {
+            list.scroll_to(self.store.n_items() - 1, gtk::ListScrollFlags::NONE, None);
+        }
+        glib::idle_add_local_once(glib::clone!(
+            #[weak(rename_to=c)]
+            self,
+            move || c.scrolled.set_opacity(1.0)
+        ));
+    }
+    /// Adopt a freshly loaded history after a send, sticker or reaction so the
+    /// store reflects the server rather than trusting the mutation response.
+    fn adopt_page(self: &Rc<Self>, page: Page) {
+        self.task.borrow_mut().take();
+        self.pagination.borrow_mut().reset();
+        self.replacing.set(true);
+        let generation = self.pagination.borrow().generation;
+        self.finish(generation, Ok(page));
+    }
+    /// Choose or clear the reply target shown above the composer.
+    pub(super) fn set_reply_to(self: &Rc<Self>, message: Option<Message>) {
+        *self.reply_to.borrow_mut() = message.clone();
+        let Some(bar) = self.reply_bar.borrow().clone() else {
+            return;
+        };
+        while let Some(child) = bar.first_child() {
+            bar.remove(&child);
+        }
+        let Some(target) = message else {
+            bar.set_visible(false);
+            return;
+        };
+        let icon = gtk::Image::from_icon_name("mail-reply-sender-symbolic");
+        icon.set_valign(gtk::Align::Center);
+        icon.add_css_class("dim-label");
+        bar.append(&icon);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        text.set_hexpand(true);
+        text.set_valign(gtk::Align::Center);
+        let ui = self.ui.upgrade();
+        let own = ui
+            .as_ref()
+            .and_then(|ui| ui.client.borrow().clone())
+            .is_some_and(|c| c.account_id == target.sender);
+        let name = if own {
+            "yourself".to_owned()
+        } else if let Route::Thread(thread) = &*self.route.borrow() {
+            thread
+                .participants
+                .iter()
+                .find(|u| u.id == target.sender)
+                .map(|u| format!("@{}", u.username))
+                .unwrap_or_else(|| "this message".into())
+        } else {
+            "this message".into()
+        };
+        let heading = label(&format!("Replying to {name}"));
+        heading.add_css_class("caption-heading");
+        heading.set_selectable(false);
+        text.append(&heading);
+        let snippet = if target.text.is_empty() {
+            message_snippet(&target.attachments).to_owned()
+        } else {
+            target.text.clone()
+        };
+        let snippet = label(&snippet);
+        snippet.add_css_class("caption");
+        snippet.add_css_class("dim-label");
+        snippet.set_lines(1);
+        snippet.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        snippet.set_selectable(false);
+        text.append(&snippet);
+        bar.append(&text);
+        let cancel = icon_button("window-close-symbolic", "Cancel reply");
+        cancel.add_css_class("flat");
+        cancel.set_valign(gtk::Align::Center);
+        cancel.connect_clicked(glib::clone!(
+            #[weak(rename_to=c)]
+            self,
+            move |_| c.set_reply_to(None)
+        ));
+        bar.append(&cancel);
+        bar.set_visible(true);
+        if let Some(entry) = self.composer_entry.borrow().as_ref() {
+            entry.grab_focus();
+        }
+    }
+    /// Toggle an emoji reaction on a message and reconcile history after.
+    pub(super) fn react_to(self: &Rc<Self>, message: &Message, emoji: &str) {
+        let Route::Thread(thread) = self.route.borrow().clone() else {
+            return;
+        };
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let Some(client) = ui.client.borrow().clone() else {
+            return;
+        };
+        let message = message.clone();
+        let emoji = emoji.to_owned();
+        *self.message_task.borrow_mut() = Some(app::background(
+            async move { client.react_message(&thread, &message, &emoji).await },
+            glib::clone!(
+                #[weak(rename_to=c)]
+                self,
+                #[weak]
+                ui,
+                move |result| {
+                    c.message_task.borrow_mut().take();
+                    match result {
+                        Ok(page) => c.adopt_page(page),
+                        Err(error) => {
+                            tracing::warn!(kind=?error, "Reaction send failed");
+                            ui.notify("Couldn't send the reaction");
+                        }
+                    }
+                }
+            ),
+        ));
+    }
+    /// Scroll a reply quote's original message into view when it is loaded.
+    pub(super) fn scroll_to_message(&self, id: &str) {
+        let Some(list) = self.list.borrow().clone() else {
+            return;
+        };
+        for index in 0..self.store.n_items() {
+            let Some(object) = self
+                .store
+                .item(index)
+                .and_downcast::<glib::BoxedAnyObject>()
+            else {
+                continue;
+            };
+            if matches!(&*object.borrow::<Item>(), Item::Message(m) if m.id == id) {
+                list.scroll_to(index, gtk::ListScrollFlags::NONE, None);
+                return;
+            }
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.notify("The original message isn't loaded yet");
+        }
+    }
+    /// Send a tray sticker and reconcile delivery from the refreshed history.
+    fn send_sticker(self: &Rc<Self>, sticker: &Sticker) {
+        let Route::Thread(thread) = self.route.borrow().clone() else {
+            return;
+        };
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let Some(client) = ui.client.borrow().clone() else {
+            return;
+        };
+        let sticker = sticker.clone();
+        let context = offline_id();
+        *self.message_task.borrow_mut() = Some(app::background(
+            async move { client.send_sticker(&thread, &sticker, &context).await },
+            glib::clone!(
+                #[weak(rename_to=c)]
+                self,
+                #[weak]
+                ui,
+                move |result| {
+                    c.message_task.borrow_mut().take();
+                    match result {
+                        Ok(Some(page)) => c.adopt_page(page),
+                        Ok(None) => {
+                            ui.notify("Sticker delivery is unconfirmed. Refresh before retrying.")
+                        }
+                        Err(error) => {
+                            tracing::warn!(kind=?error, "Sticker send failed");
+                            ui.notify("Couldn't send the sticker");
+                        }
+                    }
+                }
+            ),
+        ));
+    }
+    /// The smiley button left of the entry opens the sticker tray popover.
+    fn sticker_button(self: &Rc<Self>, ui: &Rc<Ui>) -> gtk::MenuButton {
+        let button = gtk::MenuButton::new();
+        button.set_icon_name("face-smile-symbolic");
+        button.add_css_class("flat");
+        button.set_valign(gtk::Align::Center);
+        button.set_tooltip_text(Some("Send a sticker"));
+        button.update_property(&[gtk::accessible::Property::Label("Send a sticker")]);
+        let popover = gtk::Popover::new();
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_width(300)
+            .max_content_height(360)
+            .propagate_natural_height(true)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        scroll.set_child(Some(&content));
+        popover.set_child(Some(&scroll));
+        button.set_popover(Some(&popover));
+        popover.connect_map(glib::clone!(
+            #[weak(rename_to=c)]
+            self,
+            #[weak]
+            ui,
+            #[weak]
+            content,
+            move |popover| {
+                c.populate_sticker_tray(&ui, &content, popover);
+                if c.sticker_packs.borrow().is_some() {
+                    return;
+                }
+                let Some(client) = ui.client.borrow().clone() else {
+                    return;
+                };
+                *c.sticker_task.borrow_mut() = Some(app::background(
+                    async move { client.stickers().await },
+                    glib::clone!(
+                        #[weak]
+                        c,
+                        #[weak]
+                        ui,
+                        #[weak]
+                        content,
+                        #[weak]
+                        popover,
+                        move |result| {
+                            c.sticker_task.borrow_mut().take();
+                            match result {
+                                Ok(packs) => {
+                                    c.sticker_packs.borrow_mut().replace(Rc::new(packs));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(kind=?error, "Sticker tray failed");
+                                    c.sticker_packs.borrow_mut().replace(Rc::new(Vec::new()));
+                                }
+                            }
+                            c.populate_sticker_tray(&ui, &content, &popover);
+                        }
+                    ),
+                ));
+            }
+        ));
+        button
+    }
+    fn populate_sticker_tray(
+        self: &Rc<Self>,
+        ui: &Rc<Ui>,
+        content: &gtk::Box,
+        popover: &gtk::Popover,
+    ) {
+        while let Some(child) = content.first_child() {
+            content.remove(&child);
+        }
+        match self.sticker_packs.borrow().clone() {
+            Some(packs) if !packs.is_empty() => {
+                for pack in packs.iter() {
+                    if !pack.title.is_empty() {
+                        let heading = label(&pack.title);
+                        heading.add_css_class("caption-heading");
+                        heading.set_halign(gtk::Align::Start);
+                        content.append(&heading);
+                    }
+                    let grid = gtk::FlowBox::new();
+                    grid.set_selection_mode(gtk::SelectionMode::None);
+                    grid.set_min_children_per_line(4);
+                    grid.set_max_children_per_line(4);
+                    grid.set_homogeneous(true);
+                    grid.set_row_spacing(6);
+                    grid.set_column_spacing(6);
+                    for sticker in &pack.stickers {
+                        let cell = gtk::Button::new();
+                        cell.add_css_class("flat");
+                        cell.add_css_class("sticker-cell");
+                        let preview = media::preview(ui.images.clone(), &sticker.media, 400, false);
+                        preview.set_size_request(64, 64);
+                        cell.set_child(Some(&preview));
+                        if !sticker.alt.is_empty() {
+                            cell.set_tooltip_text(Some(&sticker.alt));
+                        }
+                        cell.connect_clicked(glib::clone!(
+                            #[weak]
+                            popover,
+                            #[weak(rename_to=c)]
+                            self,
+                            #[strong]
+                            sticker,
+                            move |_| {
+                                popover.popdown();
+                                c.send_sticker(&sticker);
+                            }
+                        ));
+                        grid.insert(&cell, -1);
+                    }
+                    content.append(&grid);
+                }
+            }
+            Some(_) => {
+                let empty = label("No stickers available");
+                empty.add_css_class("dim-label");
+                content.append(&empty);
+            }
+            None => {
+                let spinner = adw::Spinner::new();
+                spinner.set_size_request(24, 24);
+                spinner.set_halign(gtk::Align::Center);
+                spinner.set_margin_top(24);
+                spinner.set_margin_bottom(24);
+                content.append(&spinner);
+            }
+        }
+    }
     fn load_near_end(self: &Rc<Self>) {
         if !self.scrolled.is_mapped() || self.auto_failed.get() {
             return;
@@ -550,6 +896,67 @@ impl Collection {
             self.load();
         }
     }
+    /// Rows only start fetching when they map; warm the cache now so media is
+    /// already arriving before the list scrolls to it. Sizes must match the
+    /// renderers in `render_item` or the keys miss the shared request locks.
+    fn prefetch(&self, ui: &Rc<Ui>, additions: &[glib::BoxedAnyObject]) {
+        let grid = self.route.borrow().grid();
+        for object in additions {
+            match &*object.borrow::<Item>() {
+                Item::Post(post) => {
+                    if let Some(media) = post.media.first() {
+                        ui.images
+                            .prefetch_media(media, if grid { 400 } else { 1080 });
+                    }
+                    ui.images.prefetch_avatar(&post.author, 32);
+                }
+                Item::User(user) => ui.images.prefetch_avatar(user, 40),
+                Item::Conversation(thread) => {
+                    if let Some(user) = thread.participants.first() {
+                        ui.images.prefetch_avatar(user, 40);
+                    }
+                }
+                Item::Comment(comment) => ui.images.prefetch_avatar(&comment.author, 36),
+                Item::Story(story) => ui.images.prefetch_avatar(&story.author, 40),
+                Item::Notification(notification) => {
+                    if let Some(user) = &notification.user {
+                        ui.images.prefetch_avatar(user, 40);
+                    }
+                }
+                Item::Message(message) => {
+                    for attachment in &message.attachments {
+                        match attachment {
+                            Attachment::Media(media) => ui.images.prefetch_media(
+                                media,
+                                if media.video.is_some() { 1080 } else { 400 },
+                            ),
+                            Attachment::Animated { media, .. } => {
+                                ui.images.prefetch_media(media, 400);
+                            }
+                            Attachment::Post(post) => {
+                                if let Some(media) = post.media.first() {
+                                    ui.images.prefetch_media(media, 400);
+                                }
+                            }
+                            Attachment::Link {
+                                image_url: Some(image),
+                                ..
+                            } => ui.images.prefetch(Some(image.clone()), 160),
+                            Attachment::Link { .. }
+                            | Attachment::Voice { .. }
+                            | Attachment::Unavailable => {}
+                        }
+                    }
+                    if let Some(quoted) = &message.reply_to
+                        && let Some(media) = &quoted.thumbnail
+                    {
+                        ui.images.prefetch_media(media, 160);
+                    }
+                }
+                Item::FeedHeader => {}
+            }
+        }
+    }
     pub fn back(&self) -> bool {
         if let Some(split) = self.split.borrow().as_ref()
             && split.is_collapsed()
@@ -559,6 +966,13 @@ impl Collection {
             return true;
         }
         false
+    }
+    /// Transient surfaces call this when they reappear; the first map-time
+    /// load already covers never-loaded collections.
+    pub(super) fn poll(self: &Rc<Self>) {
+        if self.pagination.borrow().started {
+            self.refresh();
+        }
     }
     pub fn refresh(self: &Rc<Self>) {
         if let Some(thread) = self.thread.borrow().as_ref() {
@@ -605,16 +1019,37 @@ impl Collection {
             caption: "A photo from today".into(),
             media: vec![image.clone()],
             liked: false,
-            likes: 0,
-            comments: 0,
-            timestamp: 0,
+            likes: 1200,
+            comments: 34,
+            timestamp: 1788800000,
         };
+        let sticker = Media {
+            thumbnail: Some("fixture://image".into()),
+            image: Some("fixture://image".into()),
+            video: None,
+            width: 240,
+            height: 240,
+        };
+        let video = Media {
+            thumbnail: Some("fixture://image".into()),
+            image: Some("fixture://image".into()),
+            video: Some("fixture://video".into()),
+            width: 1280,
+            height: 720,
+        };
+        let mut video_post = post.clone();
+        video_post.media = vec![video.clone()];
         let items = vec![
             Item::Message(Message {
                 id: "a".into(),
                 sender: "42".into(),
                 text: "Here are the photos".into(),
                 timestamp: 1788800000000000,
+                reactions: vec![Reaction {
+                    emoji: "❤️".into(),
+                    sender: "me".into(),
+                    timestamp: 1788800010,
+                }],
                 ..Message::default()
             }),
             Item::Message(Message {
@@ -622,6 +1057,18 @@ impl Collection {
                 sender: "42".into(),
                 attachments: vec![Attachment::Media(image)],
                 timestamp: 1788800060000000,
+                reactions: vec![
+                    Reaction {
+                        emoji: "❤️".into(),
+                        sender: "me".into(),
+                        timestamp: 1788800070,
+                    },
+                    Reaction {
+                        emoji: "😂".into(),
+                        sender: "42".into(),
+                        timestamp: 1788800080,
+                    },
+                ],
                 ..Message::default()
             }),
             Item::Message(Message {
@@ -629,6 +1076,86 @@ impl Collection {
                 sender: "42".into(),
                 attachments: vec![Attachment::Post(Box::new(post))],
                 timestamp: 1788801860000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "d".into(),
+                sender: "me".into(),
+                text: "Love it, where was this?".into(),
+                timestamp: 1788802000000000,
+                reply_to: Some(QuotedMessage {
+                    id: "a".into(),
+                    sender: "42".into(),
+                    summary: "Here are the photos".into(),
+                    thumbnail: None,
+                }),
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "e".into(),
+                sender: "42".into(),
+                attachments: vec![Attachment::Animated {
+                    media: sticker,
+                    alt: "Cat waving".into(),
+                }],
+                timestamp: 1788802100000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "f".into(),
+                sender: "42".into(),
+                attachments: vec![Attachment::Voice {
+                    url: "fixture://voice".into(),
+                    duration_ms: 32000,
+                    waveform: (0..48).map(|i| ((i % 9) as f32 + 1.0) / 10.0).collect(),
+                }],
+                timestamp: 1788802200000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "g".into(),
+                sender: "me".into(),
+                attachments: vec![Attachment::Link {
+                    title: "The trail we talked about".into(),
+                    url: "https://example.com/trail".into(),
+                    image_url: Some("fixture://image".into()),
+                }],
+                timestamp: 1788802300000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "v".into(),
+                sender: "me".into(),
+                attachments: vec![Attachment::Media(video)],
+                timestamp: 1788802400000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "w".into(),
+                sender: "42".into(),
+                attachments: vec![Attachment::Post(Box::new(video_post))],
+                timestamp: 1788802500000000,
+                ..Message::default()
+            }),
+            Item::Message(Message {
+                id: "h".into(),
+                sender: "42".into(),
+                attachments: vec![Attachment::Unavailable],
+                // A >15m gap starts a new group so its divider lands in the
+                // bottom of the viewport where the mapped-only check sees it.
+                timestamp: 1788803500000000,
+                reactions: vec![
+                    Reaction {
+                        emoji: "❤️".into(),
+                        sender: "me".into(),
+                        timestamp: 1788802450,
+                    },
+                    Reaction {
+                        emoji: "😂".into(),
+                        sender: "42".into(),
+                        timestamp: 1788802460,
+                    },
+                ],
                 ..Message::default()
             }),
         ];
@@ -642,6 +1169,16 @@ impl Collection {
             first,
             thread.store.item(0).unwrap(),
             "unchanged refresh retains message widgets"
+        );
+        thread.set_reply_to(Some(Message {
+            id: "a".into(),
+            sender: "42".into(),
+            text: "Here are the photos".into(),
+            ..Message::default()
+        }));
+        assert!(
+            thread.reply_bar.borrow().as_ref().unwrap().is_visible(),
+            "choosing a reply shows the bar"
         );
     }
     #[cfg(test)]
@@ -666,11 +1203,11 @@ impl Collection {
         );
         assert!(self.banner.is_revealed());
         self.review_finish(Ok(Page::complete(vec![])));
-        assert_eq!(
-            self.store.n_items(),
-            0,
-            "successful refresh replaces content"
-        );
+        let remaining = (0..self.store.n_items())
+            .filter_map(|i| self.store.item(i).and_downcast::<glib::BoxedAnyObject>())
+            .filter(|o| !matches!(&*o.borrow::<Item>(), Item::FeedHeader))
+            .count();
+        assert_eq!(remaining, 0, "successful refresh replaces content");
         assert!(!self.retry.is_visible(), "empty state has no retry action");
     }
     pub fn reset(&self) {
@@ -690,6 +1227,8 @@ impl Collection {
             split.set_content(Some(&adw::NavigationPage::new(&empty, "Conversation")));
         }
         self.replacing.set(false);
+        self.stick_bottom.set(false);
+        self.scrolled.set_opacity(1.0);
         if self.own_profile {
             *self.route.borrow_mut() = Route::Profile(User::default());
         }
@@ -697,7 +1236,13 @@ impl Collection {
         self.profile_task.borrow_mut().take();
         self.action_task.borrow_mut().take();
         self.read_task.borrow_mut().take();
+        self.message_task.borrow_mut().take();
         self.read_watermark.borrow_mut().clear();
+        self.reply_to.borrow_mut().take();
+        if let Some(bar) = self.reply_bar.borrow().as_ref() {
+            bar.set_visible(false);
+        }
+        self.sticker_packs.borrow_mut().take();
         self.pagination.borrow_mut().reset();
         self.auto_failed.set(false);
         self.store.remove_all();
@@ -759,12 +1304,23 @@ impl Collection {
             } else {
                 user.id.clone()
             };
+            let user = user.clone();
             let client = client.clone();
             *self.task.borrow_mut() = Some(app::background(
                 async move {
-                    let user = client.profile(&id).await?;
-                    let page = client.load(Route::Profile(user.clone()), cursor).await;
-                    Ok::<_, crate::viewfinder::Error>((user, page))
+                    // The timeline only needs the username; without it the
+                    // profile fetch must finish first to learn it.
+                    if user.username.is_empty() {
+                        let user = client.profile(&id).await?;
+                        let page = client.load(Route::Profile(user.clone()), cursor).await;
+                        Ok::<_, crate::viewfinder::Error>((user, page))
+                    } else {
+                        let (user, page) = tokio::join!(
+                            client.profile(&id),
+                            client.load(Route::Profile(user.clone()), cursor)
+                        );
+                        Ok((user?, page))
+                    }
                 },
                 glib::clone!(
                     #[weak(rename_to=c)]
@@ -810,17 +1366,27 @@ impl Collection {
                 self.banner.set_revealed(false);
                 self.banner.set_button_label(None);
                 let adjustment = self.scrolled.vadjustment();
-                let initial = self.store.n_items() == 0
+                let fresh = self.store.n_items() == 0;
+                let initial = fresh
                     || adjustment.upper() - adjustment.value() - adjustment.page_size() < 40.0;
                 if !self.pagination.borrow_mut().finish(generation, &mut page) {
                     return;
                 }
-                let additions: Vec<_> = page
+                let replacing = self.replacing.replace(false);
+                let mut additions: Vec<_> = page
                     .items
                     .into_iter()
                     .map(glib::BoxedAnyObject::new)
                     .collect();
-                if self.replacing.replace(false) {
+                if let Some(ui) = self.ui.upgrade() {
+                    self.prefetch(&ui, &additions);
+                }
+                if matches!(*self.route.borrow(), Route::Home)
+                    && (replacing || self.store.n_items() == 0)
+                {
+                    additions.insert(0, glib::BoxedAnyObject::new(Item::FeedHeader));
+                }
+                if replacing {
                     if matches!(*self.route.borrow(), Route::Thread(_) | Route::Inbox) {
                         // Keep equal objects alive so polling doesn't reload their media.
                         let old_len = self.store.n_items() as usize;
@@ -861,9 +1427,12 @@ impl Collection {
                 if initial
                     && self.store.n_items() > 0
                     && matches!(*self.route.borrow(), Route::Thread(_))
-                    && let Some(list) = self.list.borrow().as_ref()
                 {
-                    list.scroll_to(self.store.n_items() - 1, gtk::ListScrollFlags::NONE, None);
+                    self.stick_bottom.set(true);
+                    if fresh {
+                        self.scrolled.set_opacity(0.0);
+                    }
+                    self.scroll_to_bottom();
                 }
                 glib::idle_add_local_once(glib::clone!(
                     #[weak(rename_to=c)]
@@ -952,9 +1521,12 @@ impl Collection {
             return;
         };
         let item = object.borrow::<Item>().clone();
+        if let Some(dismiss) = self.dismiss.borrow().as_ref() {
+            dismiss();
+        }
         match item {
-            Item::Post(_) => {
-                let posts = (0..self.store.n_items())
+            Item::Post(post) => {
+                let posts: Vec<Post> = (0..self.store.n_items())
                     .filter_map(|i| self.store.item(i).and_downcast::<glib::BoxedAnyObject>())
                     .filter_map(|o| {
                         if let Item::Post(p) = &*o.borrow::<Item>() {
@@ -964,10 +1536,14 @@ impl Collection {
                         }
                     })
                     .collect();
+                let index = posts
+                    .iter()
+                    .position(|p| p.id == post.id)
+                    .unwrap_or_default();
                 viewer::present(
                     &ui,
                     posts,
-                    position as usize,
+                    index,
                     matches!(*self.route.borrow(), Route::Story(_)),
                 );
             }
@@ -999,7 +1575,7 @@ impl Collection {
                 }
             }
             Item::Comment(c) => ui.push(Route::Profile(c.author)),
-            Item::Message(_) => (),
+            Item::Message(_) | Item::FeedHeader => (),
         }
     }
     pub(super) fn profile_header(self: &Rc<Self>, user: User) {
@@ -1256,10 +1832,21 @@ impl Collection {
             send,
             move |entry| send.set_sensitive(entry.is_editable() && !entry.text().trim().is_empty())
         ));
+        if matches!(*self.route.borrow(), Route::Thread(_)) {
+            box_.append(&self.sticker_button(&ui));
+        }
         box_.append(&entry);
         box_.append(&send);
         let composer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         composer.add_css_class("message-composer");
+        let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        reply_bar.add_css_class("reply-bar");
+        reply_bar.set_margin_start(20);
+        reply_bar.set_margin_end(20);
+        reply_bar.set_visible(false);
+        self.reply_bar.replace(Some(reply_bar.clone()));
+        self.composer_entry.replace(Some(entry.clone()));
+        composer.append(&reply_bar);
         let send_status = label("");
         send_status.add_css_class("caption");
         send_status.set_margin_start(20);
@@ -1275,16 +1862,26 @@ impl Collection {
             let is_dm=matches!(route,Route::Thread(_));
             send.set_sensitive(false);entry.set_editable(false);
             send.set_tooltip_text(Some("Sending…"));
-            send_status.set_label("Sending…");send_status.set_visible(true);
+            let spinner=adw::Spinner::new();
+            spinner.set_size_request(16,16);
+            send.set_child(Some(&spinner));
             // Retain draft for any uncertain delivery; never automatically resend.
             let context=offline_id();
+            let reply=c.reply_to.borrow().clone();
+            c.set_reply_to(None);
+            let reply_restore=reply.clone();
             *c.action_task.borrow_mut()=Some(app::background(async move {match route {
-                Route::Thread(t)=>client.send_message(&t,&text,&context).await.map(|page|(None,page)),
+                Route::Thread(t)=>client.send_message(&t,&text,&context,reply.as_ref()).await.map(|page|(None,page)),
                 Route::Comments(p)=>client.comment(&p,&text).await.map(|c|(Some(Item::Comment(c)),None)),
                 _=>Err(crate::viewfinder::Error::Unsupported),
-            }},glib::clone!(#[weak] c,#[weak] ui,#[weak] entry,#[weak] send,#[weak] send_status,move |r|{
+            }},glib::clone!(#[weak] c,#[weak] ui,#[weak] entry,#[weak] send,#[weak] send_status,#[strong] reply_restore,move |r|{
                 entry.set_editable(true);send.set_sensitive(!entry.text().trim().is_empty());
                 send.set_tooltip_text(Some(if is_dm { "Send" } else { "Post comment" }));
+                if is_dm {
+                    send.set_child(Some(&gtk::Image::from_icon_name("mail-send-symbolic")));
+                } else {
+                    send.set_child(Some(&gtk::Label::new(Some("Post"))));
+                }
                 match r {
                     Ok((Some(item),_))=>{send_status.set_visible(false);c.store.append(&glib::BoxedAnyObject::new(item));c.stack.set_visible_child_name("content");entry.set_text("");},
                     Ok((_,Some(page)))=>{
@@ -1294,11 +1891,11 @@ impl Collection {
                         let generation=c.pagination.borrow().generation;
                         c.finish(generation,Ok(page));
                         entry.set_text("");
-                        send_status.set_label("Sent");
+                        send_status.set_visible(false);
                         entry.grab_focus();
                     },
-                    Ok((None,None))=>{c.refresh();send_status.set_label("Delivery is unconfirmed. Check the conversation before retrying; your draft is saved.");},
-                    Err(e)=>{tracing::warn!(kind=?e,"Send failed");if is_dm{send_status.set_label("Delivery could not be confirmed. Refresh before retrying; your draft is saved.");}else{send_status.set_visible(false);ui.notify(&e.to_string());}},
+                    Ok((None,None))=>{c.set_reply_to(reply_restore);c.refresh();send_status.set_label("Delivery is unconfirmed. Check the conversation before retrying; your draft is saved.");send_status.set_visible(true);},
+                    Err(e)=>{tracing::warn!(kind=?e,"Send failed");if is_dm{c.set_reply_to(reply_restore);send_status.set_label("Delivery could not be confirmed. Refresh before retrying; your draft is saved.");send_status.set_visible(true);}else{send_status.set_visible(false);ui.notify(&e.to_string());}},
                 }
             })));
         }));
@@ -1329,9 +1926,19 @@ fn offline_id() -> String {
     ((millis << 22) | bits as u64).to_string()
 }
 
-fn render_item(ui: &Rc<Ui>, item: &Item, route: &Route) -> gtk::Widget {
-    if matches!(route, Route::Notifications | Route::Search(_))
-        && let Some(row) = super::discovery::result_row(ui, item)
+fn render_item(
+    ui: &Rc<Ui>,
+    item: &Item,
+    route: &Route,
+    collection: &Rc<Collection>,
+) -> gtk::Widget {
+    if let Item::Message(message) = item {
+        return super::messages::row(ui, message, route, collection);
+    }
+    if matches!(
+        route,
+        Route::Notifications | Route::Search(_) | Route::Followers(..)
+    ) && let Some(row) = super::discovery::result_row(ui, item)
     {
         return row;
     }
@@ -1511,124 +2118,8 @@ fn render_item(ui: &Rc<Ui>, item: &Item, route: &Route) -> gtk::Widget {
             Some(s.author.clone()),
         ),
         Item::Notification(n) => (n.text.clone(), String::new(), n.user.clone()),
-        Item::Message(m) => {
-            let own = ui
-                .client
-                .borrow()
-                .as_ref()
-                .is_some_and(|c| c.account_id == m.sender);
-            (
-                if own {
-                    "You".into()
-                } else if let Route::Thread(t) = route {
-                    t.participants
-                        .iter()
-                        .find(|u| u.id == m.sender)
-                        .map(|u| u.username.clone())
-                        .unwrap_or_else(|| "Participant".into())
-                } else {
-                    "Participant".into()
-                },
-                m.text.clone(),
-                None,
-            )
-        }
-        Item::Post(_) => unreachable!(),
+        Item::Message(_) | Item::Post(_) | Item::FeedHeader => unreachable!(),
     };
-    if let Item::Message(m) = item {
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let own = ui
-            .client
-            .borrow()
-            .as_ref()
-            .is_some_and(|c| c.account_id == m.sender);
-        if !own && matches!(route, Route::Thread(t) if t.participants.len() > 1) {
-            let sender = label(&title);
-            sender.add_css_class("caption-heading");
-            body.append(&sender);
-        }
-        if !subtitle.is_empty() {
-            body.append(&label(&subtitle));
-        }
-        for attachment in &m.attachments {
-            match attachment {
-                Attachment::Media(m) => {
-                    body.append(&message_media(ui, m));
-                }
-                Attachment::Post(post) => {
-                    let b = gtk::Button::new();
-                    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-                    card.append(&label(&format!("Post by {}", post.author.username)));
-                    if let Some(media) = post.media.first() {
-                        let preview = media::preview(ui.images.clone(), media, 400, false);
-                        preview.set_size_request(220, 220);
-                        card.append(&preview);
-                    }
-                    if !post.caption.is_empty() {
-                        let caption = label(&post.caption);
-                        caption.set_lines(3);
-                        caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                        card.append(&caption);
-                    }
-                    b.set_child(Some(&card));
-                    b.connect_clicked(glib::clone!(
-                        #[weak]
-                        ui,
-                        #[strong]
-                        post,
-                        move |_| viewer::present(&ui, vec![*post.clone()], 0, false)
-                    ));
-                    body.append(&b);
-                }
-                Attachment::Link { title, url } => {
-                    if url.starts_with("https://") {
-                        body.append(&gtk::LinkButton::with_label(url, title));
-                    } else {
-                        body.append(&label("Link unavailable"));
-                    }
-                }
-                Attachment::Unavailable => body.append(&label("This attachment is unavailable")),
-            }
-        }
-        body.add_css_class("message-bubble");
-        body.set_tooltip_text(format::message_timestamp(m.timestamp).as_deref());
-        if !m.seen_by.is_empty() {
-            let seen = label(&format!("Seen by {}", m.seen_by.join(", ")));
-            seen.add_css_class("caption");
-            body.append(&seen);
-        }
-        let own = ui
-            .client
-            .borrow()
-            .as_ref()
-            .is_some_and(|c| c.account_id == m.sender);
-        body.set_halign(if own {
-            gtk::Align::End
-        } else {
-            gtk::Align::Start
-        });
-        if own {
-            body.add_css_class("outgoing");
-        }
-        // Align bubbles within the same column as the composer. A second centered
-        // clamp here pulls both sides of the conversation into the middle.
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row.set_margin_start(20);
-        row.set_margin_end(20);
-        row.set_margin_top(1);
-        row.set_margin_bottom(1);
-        let space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        space.set_hexpand(true);
-        space.set_size_request(40, -1);
-        if own {
-            row.append(&space);
-            row.append(&body);
-        } else {
-            row.append(&body);
-            row.append(&space);
-        }
-        return row.upcast();
-    }
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.set_margin_start(12);
     row.set_margin_end(12);
@@ -1749,38 +2240,15 @@ pub(super) fn comment_button(ui: &Rc<Ui>, post: &Post) -> gtk::Button {
     button
 }
 
-fn message_media(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
-    let widget = if media.video.is_some() {
-        super::inline_video::new(ui, media)
-    } else {
-        let button = gtk::Button::new();
-        let preview = media::preview(ui.images.clone(), media, 400, false);
-        preview.set_size_request(220, 220);
-        button.set_child(Some(&preview));
-        button.add_css_class("flat");
-        button.set_tooltip_text(Some("Open image"));
-        let post = Post {
-            id: String::new(),
-            code: String::new(),
-            author: User::default(),
-            caption: String::new(),
-            media: vec![media.clone()],
-            liked: false,
-            likes: 0,
-            comments: 0,
-            timestamp: 0,
-        };
-        button.connect_clicked(glib::clone!(
-            #[weak]
-            ui,
-            move |_| viewer::present(&ui, vec![post.clone()], 0, false)
-        ));
-        button.upcast()
-    };
-    let clamp = adw::Clamp::builder()
-        .maximum_size(300)
-        .tightening_threshold(240)
-        .child(&widget)
-        .build();
-    clamp.upcast()
+/// A short attachment description for the reply bar's quoted snippet.
+fn message_snippet(attachments: &[Attachment]) -> &'static str {
+    match attachments.first() {
+        Some(Attachment::Media(media)) if media.video.is_some() => "Video",
+        Some(Attachment::Media(_)) => "Photo",
+        Some(Attachment::Post(_)) => "Post",
+        Some(Attachment::Animated { .. }) => "Sticker",
+        Some(Attachment::Link { .. }) => "Link",
+        Some(Attachment::Voice { .. }) => "Voice message",
+        _ => "Message",
+    }
 }

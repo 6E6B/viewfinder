@@ -1,8 +1,8 @@
 mod app;
 mod domain;
-mod viewfinder;
 mod media;
 mod ui;
+mod viewfinder;
 
 use adw::prelude::*;
 use gtk::{gio, glib};

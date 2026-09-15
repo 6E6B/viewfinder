@@ -3,6 +3,7 @@
 use super::{Client, Error, normalize as n, validate_id};
 use crate::domain::*;
 use serde_json::json;
+use std::sync::Arc;
 
 fn confirmed_like(
     v: &serde_json::Value,
@@ -19,7 +20,17 @@ fn confirmed_like(
 }
 
 impl Client {
-    async fn dm_mailbox(&self) -> Result<serde_json::Value, Error> {
+    /// Inbox, thread and send paths all need the same mailbox snapshot within
+    /// seconds of each other; hold the lock across the fetch so concurrent
+    /// callers share one request instead of duplicating it.
+    async fn dm_mailbox(&self) -> Result<Arc<serde_json::Value>, Error> {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut cached = self.mailbox_cache.lock().await;
+        if let Some((fetched, mailbox)) = cached.as_ref()
+            && fetched.elapsed() < FRESH
+        {
+            return Ok(mailbox.clone());
+        }
         let device = self.device_id.as_ref().ok_or(Error::SessionFile)?;
         let v = self
             .graphql(
@@ -31,12 +42,35 @@ impl Client {
                     "__relay_internal__pv__IGDMaxUnreadMessagesCountrelayprovider": 5,
                     "__relay_internal__pv__IGDThreadListActionsEnabledGKrelayprovider": true
                 }),
-                false,
+                true,
             )
             .await?;
         let mailbox = &v["data"]["get_slide_mailbox_for_iris_subscription"];
         n::array(&mailbox["threads_by_folder"]["edges"])?;
-        Ok(mailbox.clone())
+        let mailbox = Arc::new(mailbox.clone());
+        *cached = Some((std::time::Instant::now(), mailbox.clone()));
+        Ok(mailbox)
+    }
+
+    /// Thread history from the slide (msys) channel. `direct_v2` masks newer
+    /// item types as `placeholder`; slide messages carry the real content.
+    async fn thread_slide(&self, fbid: Option<&str>) -> Result<serde_json::Value, Error> {
+        let Some(fbid) = fbid else {
+            return Err(Error::Protocol);
+        };
+        let v = self
+            .graphql(
+                "28047224604940200",
+                json!({
+                    "min_uq_seq_id": null,
+                    "thread_fbid": fbid,
+                    "__relay_internal__pv__IGDEnableOffMsysChatThemesQErelayprovider": false,
+                    "__relay_internal__pv__IGDInitialMessagePageCountrelayprovider": 20
+                }),
+                true,
+            )
+            .await?;
+        Ok(v["data"]["get_slide_thread_nullable"]["as_ig_direct_thread"].clone())
     }
 
     pub async fn load(&self, route: Route, cursor: Option<String>) -> Result<Page, Error> {
@@ -164,29 +198,29 @@ impl Client {
                 })
             }
             Route::Inbox => {
-                let v = self
-                    .get(
-                        "direct_v2/inbox/",
-                        &[
-                            ("limit", "20".into()),
-                            ("persistentBadging", "true".into()),
-                            ("folder", "".into()),
-                        ],
-                    )
-                    .await?;
+                let params: [(&str, String); 3] = [
+                    ("limit", "20".into()),
+                    ("persistentBadging", "true".into()),
+                    ("folder", "".into()),
+                ];
+                let (inbox, mailbox) =
+                    tokio::join!(self.get("direct_v2/inbox/", &params), self.dm_mailbox());
+                let v = inbox?;
                 let mut page = Page::complete(
                     n::array(&v["inbox"]["threads"])?
                         .iter()
                         .map(|x| n::conversation(x).map(Item::Conversation))
                         .collect::<Result<_, _>>()?,
                 );
-                if let Ok(mailbox) = self.dm_mailbox().await {
+                if let Ok(mailbox) = mailbox {
+                    let viewer = mailbox["id"].as_str();
                     for item in &mut page.items {
                         if let Item::Conversation(thread) = item
                             && let Some(node) = mailbox_thread(&mailbox, &thread.id)
                         {
                             thread.thread_fbid = node_fbid(node);
-                            thread.unread = node["marked_as_unread"].as_bool().unwrap_or(false);
+                            thread.unread =
+                                thread.unread || thread_unread(node, viewer, &self.account_id);
                         }
                     }
                 }
@@ -195,21 +229,37 @@ impl Client {
             }
             Route::Thread(thread) => {
                 validate_id(&thread.id)?;
-                let v = self
-                    .get(
-                        &format!("direct_v2/threads/{}/", thread.id),
-                        &[("limit", "20".into())],
-                    )
-                    .await?;
+                let path = format!("direct_v2/threads/{}/", thread.id);
+                let params: [(&str, String); 1] = [("limit", "20".into())];
+                let (history, mailbox, slide) = tokio::join!(
+                    self.get(&path, &params),
+                    self.dm_mailbox(),
+                    self.thread_slide(thread.thread_fbid.as_deref())
+                );
+                let v = history?;
                 let mut messages = n::array(&v["thread"]["items"])?
                     .iter()
                     .map(n::message)
                     .collect::<Result<Vec<_>, _>>()?;
                 messages.sort_by_key(|m| m.timestamp);
-                if let Ok(mailbox) = self.dm_mailbox().await
+                let mut mailbox_fbid = None;
+                if let Ok(mailbox) = mailbox
                     && let Some(node) = mailbox_thread(&mailbox, &thread.id)
                 {
                     enrich_messages(&mut messages, node, &self.account_id);
+                    merge_slide_content(&mut messages, node);
+                    mailbox_fbid = node_fbid(node);
+                }
+                let slide = match slide {
+                    // The web thread id may only resolve once the mailbox lands.
+                    Err(error) if thread.thread_fbid.is_none() => match mailbox_fbid.as_deref() {
+                        Some(fbid) => self.thread_slide(Some(fbid)).await,
+                        None => Err(error),
+                    },
+                    other => other,
+                };
+                if let Ok(slide) = slide {
+                    merge_slide_content(&mut messages, &slide);
                 }
                 let mut page = Page::complete(messages.into_iter().map(Item::Message).collect());
                 page.continuation_unavailable = true;
@@ -401,6 +451,34 @@ impl Client {
         let v = self.graphql("27261905640092552",json!({"data":{"comment_text":text,"media_id":post.id,"replied_to_comment_id":null,"tracking_token":null}}),true).await?;
         n::comment(&v["data"]["xig_comment_create"]["comment_dict"])
     }
+    pub async fn mark_story_seen(&self, story: &Story, post: &Post) -> Result<(), Error> {
+        for id in [&story.id, &post.id, &story.author.id] {
+            validate_id(id)?;
+        }
+        let seen_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let v = self
+            .graphql(
+                "36133297086317984",
+                json!({
+                    "reelId": story.id,
+                    "reelMediaId": post.id,
+                    "reelMediaOwnerId": story.author.id,
+                    "reelMediaTakenAt": post.timestamp,
+                    "viewSeenAt": seen_at
+                }),
+                true,
+            )
+            .await?;
+        if v["data"]["xdt_mark_story_reel_seen"]["__typename"].is_string() {
+            Ok(())
+        } else {
+            tracing::warn!(response = %super::diagnostics::shape(&v), "Story seen response did not confirm the mutation");
+            Err(Error::Protocol)
+        }
+    }
     /// The supplied reference has no send receipt schema. A successful transport
     /// response is not represented as confirmed delivery. UI must reconcile history.
     pub async fn send_message(
@@ -408,6 +486,7 @@ impl Client {
         thread: &Conversation,
         text: &str,
         context: &str,
+        reply_to: Option<&Message>,
     ) -> Result<Option<Page>, Error> {
         validate_id(&thread.id)?;
         let mut target = thread.clone();
@@ -420,7 +499,7 @@ impl Client {
         let result = self
             .graphql(
                 "26911679871773184",
-                send_variables(&target, text, context),
+                send_variables(&target, text, context, reply_to),
                 true,
             )
             .await;
@@ -439,6 +518,149 @@ impl Client {
         }
         result?;
         Ok(None)
+    }
+
+    /// Emoji reactions broadcast over REST `broadcast/reaction/` and confirm by
+    /// reloading history: a transport success without the reaction on the item
+    /// is not a completed reaction.
+    pub async fn react_message(
+        &self,
+        thread: &Conversation,
+        message: &Message,
+        emoji: &str,
+    ) -> Result<Page, Error> {
+        validate_id(&thread.id)?;
+        validate_id(&message.id)?;
+        let create = !message
+            .reactions
+            .iter()
+            .any(|r| r.sender == self.account_id && r.emoji == emoji);
+        let token = gtk::glib::uuid_string_random().to_string();
+        let mut fields = broadcast_fields(&thread.id, &token);
+        fields.extend([
+            ("item_type".into(), "reaction".into()),
+            ("reaction_type".into(), "like".into()),
+            (
+                "reaction_status".into(),
+                if create { "created" } else { "deleted" }.into(),
+            ),
+            ("node_type".into(), "item".into()),
+            ("item_id".into(), message.id.clone()),
+            ("emoji".into(), emoji.to_owned()),
+            ("send_attribution".into(), "message_reaction".into()),
+            ("reaction_action_source".into(), "double_tap".into()),
+        ]);
+        if let Some(device) = &self.device_id {
+            fields.push(("device_id".into(), device.clone()));
+        }
+        if let Some(context) = &message.client_context {
+            fields.push(("original_message_client_context".into(), context.clone()));
+        }
+        let response = self
+            .execute(
+                self.http
+                    .post(format!(
+                        "{}/api/v1/direct_v2/threads/broadcast/reaction/",
+                        super::BASE
+                    ))
+                    .form(&fields),
+            )
+            .await?;
+        if response["status"] != "ok" {
+            return Err(Error::Protocol);
+        }
+        self.load(Route::Thread(thread.clone()), None).await
+    }
+
+    /// Tray stickers send as a generic share referencing the sticker id. The
+    /// reference documents the tray query but no send body, so delivery is
+    /// reconciled from history exactly like text sends.
+    pub async fn send_sticker(
+        &self,
+        thread: &Conversation,
+        sticker: &Sticker,
+        context: &str,
+    ) -> Result<Option<Page>, Error> {
+        validate_id(&thread.id)?;
+        if sticker.id.is_empty() {
+            return Err(Error::Protocol);
+        }
+        let mut params = serde_json::json!({"sticker_id": sticker.id});
+        if let Some(ent) = sticker
+            .ent_type
+            .as_deref()
+            .and_then(|t| t.parse::<i64>().ok())
+        {
+            params["embedded_ent_type"] = serde_json::json!(ent);
+        }
+        let mut fields = broadcast_fields(&thread.id, context);
+        fields.push(("json_params".into(), params.to_string()));
+        if let Some(device) = &self.device_id {
+            fields.push(("device_id".into(), device.clone()));
+        }
+        let result = self
+            .execute(
+                self.http
+                    .post(format!(
+                        "{}/api/v1/direct_v2/threads/broadcast/generic_share/",
+                        super::BASE
+                    ))
+                    .form(&fields),
+            )
+            .await;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            match self.load(Route::Thread(thread.clone()), None).await {
+                Ok(page) if confirms_send(&page, &self.account_id, context) => {
+                    return Ok(Some(page));
+                }
+                Ok(_) => (),
+                Err(_) => break,
+            }
+        }
+        result?;
+        Ok(None)
+    }
+
+    /// The composer sticker tray (IGDComposerRichContentStickersV2Query).
+    pub async fn stickers(&self) -> Result<Vec<StickerPack>, Error> {
+        let v = self
+            .graphql("27793508156903587", serde_json::json!({}), false)
+            .await?;
+        let sections = n::array(&v["data"]["xig_igd_stickers_query"]["sections"]["edges"])?;
+        let mut packs = Vec::new();
+        for edge in sections {
+            let node = &edge["node"];
+            let mut pack = StickerPack {
+                title: n::string(&node["title"]),
+                ..StickerPack::default()
+            };
+            let ent_type = n::optional(&node["type"]);
+            if let Ok(edges) = n::array(&node["stickers"]["edges"]) {
+                for sticker in edges {
+                    let s = &sticker["node"];
+                    let id = n::string(&s["id"]);
+                    let Some(media) = n::sticker_media(&s["animated_info"]) else {
+                        continue;
+                    };
+                    if id.is_empty() {
+                        continue;
+                    }
+                    pack.stickers.push(Sticker {
+                        id,
+                        alt: n::string(&s["alt_text"]),
+                        media,
+                        ent_type: ent_type.clone(),
+                    });
+                }
+            }
+            if !pack.stickers.is_empty() {
+                packs.push(pack);
+            }
+        }
+        Ok(packs)
     }
 
     pub async fn mark_thread_read(
@@ -505,6 +727,63 @@ fn mailbox_thread<'a>(
         .find(|node| node["thread_id"].as_str() == Some(rest_id))
 }
 
+/// A thread is unread when manually flagged or when its latest activity is
+/// newer than the viewer's `slide_read_receipts` watermark. The viewer is
+/// identified by interop fbid: the mailbox root `id`, the `users[]` entry
+/// matching the account, or `viewer_id` on the node. A newest slide message
+/// authored by the viewer counts as read regardless of watermark lag.
+fn thread_unread(node: &serde_json::Value, viewer: Option<&str>, account_id: &str) -> bool {
+    if node["marked_as_unread"].as_bool().unwrap_or(false) {
+        return true;
+    }
+    let candidates: Vec<&str> = [
+        viewer,
+        node["users"].as_array().and_then(|users| {
+            users
+                .iter()
+                .find(|u| n::string(&u["id"]) == account_id)
+                .and_then(|u| u["interop_messaging_user_fbid"].as_str())
+        }),
+        node["viewer_id"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    let own = |v: &serde_json::Value| v.as_str().is_some_and(|fbid| candidates.contains(&fbid));
+    let newest = node["slide_messages"]["edges"]
+        .as_array()
+        .and_then(|edges| {
+            edges
+                .iter()
+                .map(|e| &e["node"])
+                .max_by_key(|m| m["timestamp_ms"].as_i64().unwrap_or(0))
+        });
+    let last_activity = node["last_activity_timestamp_ms"]
+        .as_i64()
+        .unwrap_or(0)
+        .max(newest.and_then(|m| m["timestamp_ms"].as_i64()).unwrap_or(0));
+    if last_activity <= 0 {
+        return false;
+    }
+    if newest.is_some_and(|m| {
+        own(&m["sender_fbid"]) && m["timestamp_ms"].as_i64().unwrap_or(0) >= last_activity
+    }) {
+        return false;
+    }
+    let Some(receipts) = node["slide_read_receipts"].as_array() else {
+        return false;
+    };
+    let watermark = receipts
+        .iter()
+        .find(|r| own(&r["participant_fbid"]))
+        .and_then(|r| r["watermark_timestamp_ms"].as_i64())
+        .unwrap_or(0);
+    last_activity > watermark
+}
+
 fn node_fbid(node: &serde_json::Value) -> Option<String> {
     node["thread_fbid"]
         .as_str()
@@ -512,13 +791,20 @@ fn node_fbid(node: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn send_variables(thread: &Conversation, text: &str, context: &str) -> serde_json::Value {
+fn send_variables(
+    thread: &Conversation,
+    text: &str,
+    context: &str,
+    reply_to: Option<&Message>,
+) -> serde_json::Value {
     let mut vars = json!({
         "ig_thread_igid": thread.thread_fbid.as_ref().unwrap_or(&thread.id),
         "offline_threading_id": context, "text": {"sensitive_string_value": text},
         "mentions": [], "mentioned_user_ids": [], "recipient_igids": null,
-        "replied_to_client_context": null, "replied_to_item_id": null,
-        "reply_to_message_id": null, "sampled": null, "commands": null,
+        "replied_to_client_context": reply_to.and_then(|m| m.client_context.clone()),
+        "replied_to_item_id": reply_to.map(|m| m.id.clone()),
+        "reply_to_message_id": reply_to.and_then(|m| m.message_id.clone()),
+        "sampled": null, "commands": null,
         "forwarded_from_thread_id": null, "is_forwarded_from_own_message": null,
         "send_attribution": "igd_web_chat_tab:in_thread"
     });
@@ -531,6 +817,24 @@ fn send_variables(thread: &Conversation, text: &str, context: &str) -> serde_jso
     } else {
         vars
     }
+}
+
+/// Shared form fields for `direct_v2/threads/broadcast/` item sends. The same
+/// trio of client_context, mutation_token and offline_threading_id correlates
+/// the item once history is reloaded.
+fn broadcast_fields(thread_id: &str, token: &str) -> Vec<(String, String)> {
+    vec![
+        ("action".into(), "send_item".into()),
+        ("client_context".into(), token.to_owned()),
+        ("mutation_token".into(), token.to_owned()),
+        ("offline_threading_id".into(), token.to_owned()),
+        ("thread_ids".into(), json!([thread_id]).to_string()),
+        ("is_shh_mode".into(), "0".into()),
+        ("send_silently".into(), "false".into()),
+        ("is_x_transport_forward".into(), "false".into()),
+        ("is_ae_dual_send".into(), "false".into()),
+        ("btt_dual_send".into(), "false".into()),
+    ]
 }
 
 fn enrich_messages(messages: &mut [Message], node: &serde_json::Value, account_id: &str) {
@@ -588,6 +892,154 @@ fn enrich_messages(messages: &mut [Message], node: &serde_json::Value, account_i
     }
 }
 
+/// `direct_v2` masks newer item types (cutout stickers, some shares) as
+/// `item_type: "placeholder"`, which normalizes to `Attachment::Unavailable`.
+/// The slide channel carries the real payload under `content`, keyed by the
+/// same `mid.$` id. Merge it so masked items still render.
+fn merge_slide_content(messages: &mut [Message], node: &serde_json::Value) {
+    let Some(edges) = node["slide_messages"]["edges"].as_array() else {
+        return;
+    };
+    let slides: Vec<&serde_json::Value> = edges.iter().map(|e| &e["node"]).collect();
+    let sender_fbid = |sender: &str| {
+        node["users"].as_array().and_then(|users| {
+            users
+                .iter()
+                .find(|u| n::string(&u["id"]) == sender)
+                .and_then(|u| u["interop_messaging_user_fbid"].as_str())
+        })
+    };
+    for message in messages.iter_mut() {
+        if !message
+            .attachments
+            .iter()
+            .all(|a| matches!(a, Attachment::Unavailable))
+        {
+            continue;
+        }
+        let Some(slide) = slides.iter().find(|m| {
+            (message.message_id.is_some() && m["id"].as_str() == message.message_id.as_deref())
+                || (message.timestamp > 0
+                    && sender_fbid(&message.sender)
+                        .is_some_and(|fbid| m["sender_fbid"].as_str() == Some(fbid))
+                    && m["timestamp_ms"].as_i64() == Some(message.timestamp / 1000))
+        }) else {
+            continue;
+        };
+        let content = &slide["content"];
+        match content["__typename"].as_str() {
+            Some("SlideMessageCutoutStickerXMAContent") => {
+                if let Some(url) = n::optional(&content["preview_url"]) {
+                    message.attachments = vec![Attachment::Animated {
+                        media: Media {
+                            thumbnail: Some(url.clone()),
+                            image: Some(url),
+                            video: None,
+                            width: content["preview_width"].as_i64().unwrap_or(200) as i32,
+                            height: content["preview_height"].as_i64().unwrap_or(200) as i32,
+                        },
+                        alt: n::optional(&content["alt_text"]).unwrap_or_else(|| "Sticker".into()),
+                    }];
+                }
+            }
+            Some("SlideMessageAnimatedMediaContent") => {
+                if let Some(am) = content["animated_media"].as_array().and_then(|a| a.first()) {
+                    let image = n::optional(&am["attachment_webp_url"])
+                        .or_else(|| n::optional(&am["preview_cdn_url"]));
+                    let video = n::optional(&am["attachment_mp4_url"]);
+                    if image.is_some() || video.is_some() {
+                        message.attachments = vec![Attachment::Animated {
+                            media: Media {
+                                thumbnail: image.clone(),
+                                image,
+                                video,
+                                width: am["preview_width"].as_i64().unwrap_or(200) as i32,
+                                height: am["preview_height"].as_i64().unwrap_or(200) as i32,
+                            },
+                            alt: n::optional(&am["alt_text"]).unwrap_or_else(|| "Sticker".into()),
+                        }];
+                    }
+                }
+            }
+            Some("SlideMessageImageContent") => {
+                let media: Vec<Attachment> = content["attachments"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                let url = n::optional(&item["attachment_cdn_url"])
+                                    .or_else(|| n::optional(&item["preview_cdn_url"]))?;
+                                Some(Attachment::Media(Media {
+                                    thumbnail: n::optional(&item["preview_cdn_url"])
+                                        .or_else(|| Some(url.clone())),
+                                    image: Some(url),
+                                    video: None,
+                                    width: item["preview_width"].as_i64().unwrap_or(0) as i32,
+                                    height: item["preview_height"].as_i64().unwrap_or(0) as i32,
+                                }))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !media.is_empty() {
+                    message.attachments = media;
+                }
+            }
+            Some("SlideMessageXMAContent") => {
+                let xma = &content["xma"];
+                if let Some(url) = n::optional(&xma["preview_image"]["url"])
+                    .or_else(|| n::optional(&xma["xmaPreviewImage"]["url"]))
+                {
+                    let target = n::string(&xma["target_url"]);
+                    message.attachments = vec![Attachment::Post(Box::new(Post {
+                        id: n::string(&xma["target_id"]),
+                        code: target
+                            .split('/')
+                            .filter(|part| !part.is_empty())
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        author: User {
+                            username: n::string(&xma["header_title_text"]),
+                            avatar: n::optional(&xma["header_icon"]["url"]),
+                            ..User::default()
+                        },
+                        caption: String::new(),
+                        media: vec![Media {
+                            thumbnail: Some(url.clone()),
+                            image: Some(url),
+                            video: None,
+                            width: xma["preview_image"]["width"].as_i64().unwrap_or(0) as i32,
+                            height: xma["preview_image"]["height"].as_i64().unwrap_or(0) as i32,
+                        }],
+                        liked: false,
+                        likes: 0,
+                        comments: 0,
+                        timestamp: 0,
+                    }))];
+                }
+            }
+            Some("SlideMessageAdminText") if message.text.is_empty() => {
+                let text = content["text_fragments"]
+                    .as_array()
+                    .map(|fragments| {
+                        fragments
+                            .iter()
+                            .filter_map(|f| f["plaintext"].as_str())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    message.text = text;
+                    message.attachments = vec![];
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod like_tests {
     use super::*;
@@ -598,15 +1050,43 @@ mod like_tests {
             thread_fbid: Some("987".into()),
             ..Conversation::default()
         };
-        let vars = send_variables(&thread, "Hello\n🌻", "123");
+        let vars = send_variables(&thread, "Hello\n🌻", "123", None);
         assert_eq!(vars["ig_thread_igid"], "987");
         assert_eq!(vars["text"]["sensitive_string_value"], "Hello\n🌻");
         assert_eq!(vars["send_attribution"], "igd_web_chat_tab:in_thread");
         assert!(vars.get("data").is_none());
+        assert!(vars["replied_to_item_id"].is_null());
+        let original = Message {
+            id: "30123".into(),
+            message_id: Some("mid.$abc".into()),
+            client_context: Some("ctx-1".into()),
+            ..Message::default()
+        };
+        let replied = send_variables(&thread, "Back", "124", Some(&original));
+        assert_eq!(replied["replied_to_item_id"], "30123");
+        assert_eq!(replied["replied_to_client_context"], "ctx-1");
+        assert_eq!(replied["reply_to_message_id"], "mid.$abc");
         thread.thread_fbid = None;
-        let legacy = send_variables(&thread, "Hello", "123");
+        let legacy = send_variables(&thread, "Hello", "123", Some(&original));
         assert_eq!(legacy["data"]["ig_thread_igid"], "34028236");
         assert_eq!(legacy["data"]["text"], "Hello");
+        assert_eq!(legacy["data"]["replied_to_item_id"], "30123");
+    }
+
+    #[test]
+    fn broadcast_forms_carry_correlation_tokens_and_targets() {
+        let fields = broadcast_fields("34028236", "token-1");
+        let get = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("action"), Some("send_item"));
+        assert_eq!(get("client_context"), Some("token-1"));
+        assert_eq!(get("mutation_token"), Some("token-1"));
+        assert_eq!(get("offline_threading_id"), Some("token-1"));
+        assert_eq!(get("thread_ids"), Some("[\"34028236\"]"));
     }
 
     #[test]
@@ -680,6 +1160,39 @@ mod like_tests {
         );
         assert!(mailbox_thread(&mailbox, "url").is_none());
     }
+
+    #[test]
+    fn inbox_unread_uses_viewer_watermark_and_own_latest_message() {
+        let node = json!({
+            "thread_id": "rest",
+            "last_activity_timestamp_ms": 10000,
+            "users": [
+                {"id":"me","username":"myself","interop_messaging_user_fbid":"10"},
+                {"id":"them","username":"alex","interop_messaging_user_fbid":"20"}
+            ],
+            "slide_messages": {"edges": [
+                {"node": {"sender_fbid":"20","timestamp_ms":9000}},
+                {"node": {"sender_fbid":"20","timestamp_ms":10000}}
+            ]},
+            "slide_read_receipts": [
+                {"participant_fbid":"10","watermark_timestamp_ms":10000},
+                {"participant_fbid":"20","watermark_timestamp_ms":10000}
+            ]
+        });
+        assert!(!thread_unread(&node, Some("10"), "me"));
+        let mut stale = node.clone();
+        stale["slide_read_receipts"][0]["watermark_timestamp_ms"] = json!(9000);
+        assert!(thread_unread(&stale, Some("10"), "me"));
+        assert!(thread_unread(&stale, None, "me"));
+        stale["marked_as_unread"] = json!(true);
+        assert!(thread_unread(&stale, Some("10"), "me"));
+        let mut own = node.clone();
+        own["slide_read_receipts"][0]["watermark_timestamp_ms"] = json!(9000);
+        own["slide_messages"]["edges"][1]["node"]["sender_fbid"] = json!("10");
+        assert!(!thread_unread(&own, Some("10"), "me"));
+        assert!(!thread_unread(&node, None, "stranger"));
+    }
+
     #[test]
     fn comment_and_story_success_requires_the_expected_payload() {
         for (key, name, liked) in [
@@ -729,5 +1242,132 @@ mod like_tests {
             assert!(c.liked);
             assert_eq!(c.likes, 12);
         }
+    }
+
+    /// REST `placeholder` items carry the slide `mid.$` id; slide `content`
+    /// restores the masked attachment.
+    #[test]
+    fn slide_content_replaces_masked_placeholder_attachments() {
+        let node = json!({
+            "users": [{"id":"them","username":"alex","interop_messaging_user_fbid":"20"}],
+            "slide_messages": {"edges": [
+                {"node": {"id":"mid.$cut", "sender_fbid":"20", "timestamp_ms":9000,
+                    "content": {"__typename":"SlideMessageCutoutStickerXMAContent",
+                        "preview_url":"https://scontent-det1-1.cdninstagram.com/v/sticker.png",
+                        "preview_width":878, "preview_height":1220, "alt_text":null}}},
+                {"node": {"id":"mid.$gif", "sender_fbid":"20", "timestamp_ms":8000,
+                    "content": {"__typename":"SlideMessageAnimatedMediaContent",
+                        "animated_media": [{"attachment_webp_url":"https://external-det1-1.xx.fbcdn.net/v/a.webp",
+                            "attachment_mp4_url":"https://external-det1-1.xx.fbcdn.net/v/a.mp4",
+                            "preview_cdn_url":"https://external-det1-1.xx.fbcdn.net/v/p.webp",
+                            "preview_width":211, "preview_height":200, "is_sticker":true}]}}},
+                {"node": {"id":"mid.$admin", "sender_fbid":"20", "timestamp_ms":7000,
+                    "content": {"__typename":"SlideMessageAdminText",
+                        "text_fragments":[{"plaintext":"Liked a message"}]}}}
+            ]}
+        });
+        let mut messages = vec![
+            Message {
+                message_id: Some("mid.$cut".into()),
+                sender: "them".into(),
+                timestamp: 9000000,
+                attachments: vec![Attachment::Unavailable],
+                ..Message::default()
+            },
+            Message {
+                // No message_id: falls back to sender + timestamp matching.
+                sender: "them".into(),
+                timestamp: 8000000,
+                attachments: vec![Attachment::Unavailable],
+                ..Message::default()
+            },
+            Message {
+                message_id: Some("mid.$admin".into()),
+                sender: "them".into(),
+                timestamp: 7000000,
+                attachments: vec![Attachment::Unavailable],
+                ..Message::default()
+            },
+            Message {
+                message_id: Some("mid.$unknown".into()),
+                sender: "them".into(),
+                timestamp: 6000000,
+                attachments: vec![Attachment::Unavailable],
+                ..Message::default()
+            },
+            Message {
+                message_id: Some("mid.$text".into()),
+                sender: "them".into(),
+                timestamp: 5000000,
+                text: "keep me".into(),
+                ..Message::default()
+            },
+        ];
+        merge_slide_content(&mut messages, &node);
+        let Attachment::Animated { media, alt } = &messages[0].attachments[0] else {
+            panic!("cutout sticker should merge as animated attachment")
+        };
+        assert_eq!(
+            media.image.as_deref(),
+            Some("https://scontent-det1-1.cdninstagram.com/v/sticker.png")
+        );
+        assert_eq!((media.width, media.height), (878, 1220));
+        assert_eq!(alt, "Sticker");
+        let Attachment::Animated { media, .. } = &messages[1].attachments[0] else {
+            panic!("animated media should merge by sender and timestamp")
+        };
+        assert_eq!(
+            media.video.as_deref(),
+            Some("https://external-det1-1.xx.fbcdn.net/v/a.mp4")
+        );
+        assert_eq!(messages[2].text, "Liked a message");
+        assert!(messages[2].attachments.is_empty());
+        assert!(matches!(
+            messages[3].attachments[0],
+            Attachment::Unavailable
+        ));
+        assert!(messages[4].attachments.is_empty());
+    }
+
+    #[test]
+    #[ignore = "live thread load against the local session"]
+    fn live_thread_slide_merge() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let session = crate::viewfinder::session::Session::restore()
+                .await
+                .unwrap_or_else(|_| {
+                    crate::viewfinder::session::Session::parse(
+                        &std::fs::read("session_cookies.json").unwrap(),
+                    )
+                    .unwrap()
+                });
+            let client = Client::new(session).unwrap();
+            let thread = Conversation {
+                id: std::env::var("VF_TEST_THREAD")
+                    .unwrap_or_else(|_| "340282366841710301244260004355658495848".into()),
+                ..Conversation::default()
+            };
+            let page = client.load(Route::Thread(thread), None).await.unwrap();
+            for item in &page.items {
+                if let Item::Message(m) = item {
+                    eprintln!(
+                        "{} | text={:?} | attachments={:?}",
+                        m.id,
+                        m.text,
+                        m.attachments
+                            .iter()
+                            .map(|a| match a {
+                                Attachment::Unavailable => "unavailable".to_owned(),
+                                Attachment::Animated { .. } => "animated".to_owned(),
+                                Attachment::Media(_) => "media".to_owned(),
+                                Attachment::Post(_) => "post".to_owned(),
+                                Attachment::Link { .. } => "link".to_owned(),
+                                Attachment::Voice { .. } => "voice".to_owned(),
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        });
     }
 }

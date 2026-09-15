@@ -5,6 +5,7 @@ mod format;
 mod inline_video;
 mod login;
 mod media_frame;
+mod messages;
 mod reels;
 #[cfg(test)]
 mod review;
@@ -14,13 +15,17 @@ mod viewer;
 use crate::{
     app::{self, Task},
     domain::*,
-    viewfinder::{Client, session::Session},
     media::{Images, Playback},
+    viewfinder::{Client, session::Session},
 };
 use adw::prelude::*;
 use collection::Collection;
 use gtk::{gio, glib};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 pub struct Ui {
     pub window: glib::WeakRef<adw::ApplicationWindow>,
@@ -30,7 +35,10 @@ pub struct Ui {
     pub images: Arc<Images>,
     pub playback: Rc<Playback>,
     pub collections: RefCell<Vec<Rc<Collection>>>,
+    // Popover collections are not pages; weak refs die with their buttons.
+    notifications: RefCell<Vec<Weak<Collection>>>,
     pub task: RefCell<Option<Task>>,
+    warmup: RefCell<Option<Task>>,
     pub login_stack: gtk::Stack,
     pub login_status: adw::StatusPage,
     pub destinations: adw::ViewStack,
@@ -67,6 +75,7 @@ impl Ui {
         let refresh = icon_button("view-refresh-symbolic", "Refresh");
         refresh.set_action_name(Some("win.refresh"));
         header.pack_end(&refresh);
+        header.pack_end(&notifications_button(self));
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&collection.root));
         let page = adw::NavigationPage::new(&toolbar, &route.title());
@@ -84,15 +93,21 @@ impl Ui {
     }
     fn install_client(self: &Rc<Self>, client: Arc<Client>) {
         self.likes.borrow_mut().clear();
-        *self.client.borrow_mut() = Some(client);
+        *self.client.borrow_mut() = Some(client.clone());
+        *self.warmup.borrow_mut() = Some(app::background(
+            async move { client.prewarm().await },
+            |_| (),
+        ));
         for collection in self.collections.borrow().iter() {
             collection.reset();
         }
+        self.reset_notifications();
         self.destinations.set_visible_child_name("home");
         self.login_stack.set_visible_child_name("app");
     }
     fn logout(self: &Rc<Self>) {
         self.task.borrow_mut().take();
+        self.warmup.borrow_mut().take();
         self.playback.stop();
         self.playback.clear_cache();
         self.client.borrow_mut().take();
@@ -104,6 +119,7 @@ impl Ui {
         for c in self.collections.borrow().iter() {
             c.reset();
         }
+        self.reset_notifications();
         *self.task.borrow_mut() = Some(app::background(
             Session::forget(),
             glib::clone!(
@@ -118,6 +134,17 @@ impl Ui {
                 }
             ),
         ));
+    }
+    fn reset_notifications(&self) {
+        self.notifications
+            .borrow_mut()
+            .retain(|weak| match weak.upgrade() {
+                Some(collection) => {
+                    collection.reset();
+                    true
+                }
+                None => false,
+            });
     }
 }
 
@@ -138,7 +165,8 @@ pub fn activate(application: &adw::Application) {
     .expect("bundled icons");
     gio::resources_register(&icons);
     if let Some(display) = gtk::gdk::Display::default() {
-        gtk::IconTheme::for_display(&display).add_resource_path("/io/github/_6E6B/viewfinder/icons");
+        gtk::IconTheme::for_display(&display)
+            .add_resource_path("/io/github/_6E6B/viewfinder/icons");
     }
     if let Some(window) = application.active_window() {
         window.present();
@@ -179,7 +207,9 @@ pub fn activate(application: &adw::Application) {
         images: Images::new(),
         playback: Playback::new(),
         collections: RefCell::new(Vec::new()),
+        notifications: RefCell::new(Vec::new()),
         task: RefCell::new(None),
+        warmup: RefCell::new(None),
         login_stack: login_stack.clone(),
         login_status: login_status.clone(),
         destinations: destinations.clone(),
@@ -239,7 +269,6 @@ pub fn activate(application: &adw::Application) {
     search.set_action_name(Some("win.search"));
     header.pack_start(&search);
     let menu = gio::Menu::new();
-    menu.append(Some("Notifications"), Some("win.notifications"));
     menu.append(Some("Refresh"), Some("win.refresh"));
     menu.append(Some("Sign Out"), Some("win.logout"));
     menu.append(Some("About Viewfinder"), Some("win.about"));
@@ -294,6 +323,7 @@ pub fn activate(application: &adw::Application) {
             let refresh = icon_button("view-refresh-symbolic", "Refresh");
             refresh.set_action_name(Some("win.refresh"));
             header.pack_end(&refresh);
+            header.pack_end(&notifications_button(&ui));
             toolbar.add_top_bar(&header);
             toolbar.set_content(Some(&collection.root));
             destinations.add_titled_with_icon(&toolbar, Some(name), title, icon);
@@ -342,7 +372,7 @@ pub fn activate(application: &adw::Application) {
         #[weak]
         ui,
         move |_, page| {
-            ui.playback.stop();
+            ui.playback.stop_owned(page);
             ui.collections
                 .borrow_mut()
                 .retain(|c| c.page.borrow().as_ref() != Some(page));
@@ -355,7 +385,6 @@ pub fn activate(application: &adw::Application) {
     for (name, callback) in [
         ("search", search_dialog as fn(&Rc<Ui>)),
         ("refresh", refresh as fn(&Rc<Ui>)),
-        ("notifications", notifications as fn(&Rc<Ui>)),
         ("logout", sign_out as fn(&Rc<Ui>)),
         ("back", back as fn(&Rc<Ui>)),
         ("about", about as fn(&Rc<Ui>)),
@@ -378,11 +407,6 @@ pub fn activate(application: &adw::Application) {
         glib::Propagation::Proceed
     });
     window.present();
-}
-fn notifications(ui: &Rc<Ui>) {
-    if ui.client.borrow().is_some() {
-        ui.push(Route::Notifications);
-    }
 }
 fn sign_out(ui: &Rc<Ui>) {
     ui.logout();
@@ -422,6 +446,43 @@ fn about(ui: &Rc<Ui>) {
         .license_type(gtk::License::Gpl30)
         .build();
     dialog.present(ui.window.upgrade().as_ref());
+}
+pub fn notifications_button(ui: &Rc<Ui>) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name("preferences-system-notifications-symbolic")
+        .tooltip_text("Notifications")
+        .always_show_arrow(false)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("Notifications")]);
+    let collection = Collection::new(ui, Route::Notifications);
+    let mut live = ui.notifications.borrow_mut();
+    live.retain(|weak| weak.strong_count() > 0);
+    live.push(Rc::downgrade(&collection));
+    drop(live);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let title = label("Notifications");
+    title.add_css_class("heading");
+    title.set_selectable(false);
+    title.set_margin_start(16);
+    title.set_margin_end(16);
+    title.set_margin_top(10);
+    title.set_margin_bottom(8);
+    body.append(&title);
+    collection.root.set_vexpand(true);
+    body.append(&collection.root);
+    body.set_size_request(360, -1);
+    let popover = gtk::Popover::builder()
+        .child(&body)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    *collection.dismiss.borrow_mut() = Some(Box::new(glib::clone!(
+        #[weak]
+        popover,
+        move || popover.popdown()
+    )));
+    popover.connect_map(move |_| collection.poll());
+    button.set_popover(Some(&popover));
+    button
 }
 pub fn icon_button(icon: &str, label: &str) -> gtk::Button {
     let b = gtk::Button::builder()

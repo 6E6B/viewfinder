@@ -72,11 +72,43 @@ pub struct Conversation {
     pub preview_timestamp: i64,
 }
 
+/// An emoji reaction attached to a message. `sender` is a user id.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub sender: String,
+    pub timestamp: i64,
+}
+
+/// The quoted summary carried by a reply. Only display fields are kept; the
+/// original item is resolved from the collection when scrolling to it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuotedMessage {
+    pub id: String,
+    pub sender: String,
+    pub summary: String,
+    pub thumbnail: Option<Media>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attachment {
     Media(Media),
     Post(Box<Post>),
-    Link { title: String, url: String },
+    /// Stickers and GIFs render without a bubble background.
+    Animated {
+        media: Media,
+        alt: String,
+    },
+    Link {
+        title: String,
+        url: String,
+        image_url: Option<String>,
+    },
+    Voice {
+        url: String,
+        duration_ms: u64,
+        waveform: Vec<f32>,
+    },
     Unavailable,
 }
 
@@ -90,6 +122,24 @@ pub struct Message {
     pub text: String,
     pub timestamp: i64,
     pub attachments: Vec<Attachment>,
+    pub reply_to: Option<QuotedMessage>,
+    pub reactions: Vec<Reaction>,
+}
+
+/// A composer tray sticker. `ent_type` is forwarded to the send payload when
+/// the tray reports it as a number.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sticker {
+    pub id: String,
+    pub alt: String,
+    pub media: Media,
+    pub ent_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StickerPack {
+    pub title: String,
+    pub stickers: Vec<Sticker>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +165,7 @@ pub enum Item {
     Message(Message),
     Story(Story),
     Notification(Notification),
+    FeedHeader,
 }
 
 impl Item {
@@ -127,6 +178,7 @@ impl Item {
             Self::Message(x) => &x.id,
             Self::Story(x) => &x.id,
             Self::Notification(x) => &x.id,
+            Self::FeedHeader => "feed-header",
         }
     }
 }

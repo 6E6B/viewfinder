@@ -69,6 +69,7 @@ pub struct Client {
     device_id: Option<String>,
     blocked_until: Mutex<Option<Instant>>,
     auth_blocked: Mutex<bool>,
+    mailbox_cache: tokio::sync::Mutex<Option<(Instant, Arc<Value>)>>,
 }
 impl Client {
     pub fn new(session: Session) -> Result<Arc<Self>, Error> {
@@ -98,6 +99,12 @@ impl Client {
             ("referer", "https://www.instagram.com/"),
             ("x-requested-with", "XMLHttpRequest"),
             ("accept", "*/*"),
+            // Browsers attach fetch metadata to every request. The /api/graphql
+            // gateway rejects mutations lacking Sec-Fetch-Site with error
+            // 1357054; every request here is a same-origin CORS fetch.
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+            ("sec-fetch-dest", "empty"),
         ] {
             headers.insert(
                 header::HeaderName::from_static(key),
@@ -123,6 +130,7 @@ impl Client {
             device_id: session.values.get("ig_did").cloned(),
             blocked_until: Mutex::new(None),
             auth_blocked: Mutex::new(false),
+            mailbox_cache: tokio::sync::Mutex::new(None),
         }))
     }
     fn csrf(&self) -> Result<String, Error> {
@@ -293,19 +301,6 @@ impl Client {
         ];
         let mut request = self.http.post(format!("{BASE}{path}"));
         if mutation {
-            let needs_claim = self.www_claim.lock().unwrap().as_str() == "0";
-            if needs_claim {
-                // Read-only REST calls issue the session-bound HMAC claim used by
-                // Viewfinder's write gateway. GraphQL feed responses often do not.
-                self.get(&format!("friendships/show/{}/", self.account_id), &[])
-                    .await?;
-            }
-            if diagnostics::enabled() {
-                tracing::info!(
-                    has_server_www_claim = self.www_claim.lock().unwrap().as_str() != "0",
-                    "Prepared Viewfinder mutation session"
-                );
-            }
             let context = self.web_context().await?;
             fields.extend(context.fields.iter().cloned());
             fields.push((
@@ -318,6 +313,7 @@ impl Client {
             fields.push(("fb_api_caller_class".into(), "RelayModern".into()));
             fields.push(("server_timestamps".into(), "true".into()));
             let name = match id {
+                "28047224604940200" => Some("IGDThreadDetailQuery"),
                 "28794932076791671" => Some("PolarisDirectInboxQuery"),
                 "26911679871773184" => Some("IGDirectTextSendMutation"),
                 "27399783383056109" => Some("useIGDMarkThreadAsReadMutation"),
@@ -330,6 +326,7 @@ impl Client {
                 "27318337671093716" => Some("PolarisCommentActionsUnlikeMutation"),
                 "26938887309082050" => Some("usePolarisStoriesV4LikeMutationLikeMutation"),
                 "26510485515280697" => Some("usePolarisStoriesV4LikeMutationUnlikeMutation"),
+                "36133297086317984" => Some("PolarisAPIReelSeenMutation"),
                 _ => None,
             };
             if let Some(name) = name {
@@ -367,6 +364,13 @@ impl Client {
         validate_id(id)?;
         let v = self.get(&format!("friendships/show/{id}/"), &[]).await?;
         Ok(normalize::relationship(&v))
+    }
+    /// Warm the authenticated web context (which also captures the session
+    /// claim header) so the first mutation does not wait on the page fetch.
+    pub async fn prewarm(&self) {
+        if let Err(error) = self.web_context().await {
+            tracing::debug!(%error, "Viewfinder web-context prewarm failed");
+        }
     }
 }
 fn parse_response(bytes: &[u8]) -> Result<Value, Error> {
@@ -503,6 +507,50 @@ mod live_tests {
                 response["data"]["xig_media_unlike"]["media"]["has_liked"],
                 false
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "contacts Viewfinder and marks an already-seen story item as seen"]
+    fn story_seen_marker() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let session = Session::restore().await.unwrap_or_else(|_| {
+                Session::parse(&std::fs::read("session_cookies.json").unwrap()).unwrap()
+            });
+            let client = Client::new(session).unwrap();
+            let page = client
+                .load(Route::Stories, None)
+                .await
+                .expect("stories tray");
+            let story = page
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    Item::Story(story) if story.seen => Some(story),
+                    _ => None,
+                })
+                .expect("an already-seen story in the tray");
+            let page = client
+                .load(Route::Story(story.clone()), None)
+                .await
+                .expect("story items");
+            let post = page
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Post(post) => Some(post),
+                    _ => None,
+                })
+                .next_back()
+                .expect("a story item");
+            client
+                .mark_story_seen(&story, &post)
+                .await
+                .expect("seen marker");
+            eprintln!("Story seen marker confirmed");
         });
     }
 }

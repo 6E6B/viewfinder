@@ -26,8 +26,8 @@ pub(super) fn capture(window: &adw::ApplicationWindow, name: &str) {
     paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
     let node = snapshot.to_node().expect("rendered widget");
     let texture = window.renderer().unwrap().render_texture(&node, None);
-    let directory =
-        std::env::var("VIEWFINDER_REVIEW_DIR").unwrap_or_else(|_| "/tmp/viewfinder-ui-review".into());
+    let directory = std::env::var("VIEWFINDER_REVIEW_DIR")
+        .unwrap_or_else(|_| "/tmp/viewfinder-ui-review".into());
     std::fs::create_dir_all(&directory).unwrap();
     texture
         .save_to_png(format!("{directory}/{name}.png"))
@@ -132,7 +132,7 @@ fn rendered_review() {
             .is_some_and(|l| l.label() == "This video is unavailable.")
     }));
     ui.destinations.set_visible_child_name("profile");
-    let profile = ui.collections.borrow()[4].clone();
+    let profile = ui.collections.borrow()[3].clone();
     profile.profile_header(user());
     profile.review_finish(Ok(Page::complete(
         (0..24)
@@ -158,7 +158,7 @@ fn rendered_review() {
     assert!(window.width() <= 360);
     about.set_expanded(false);
     ui.destinations.set_visible_child_name("reels");
-    ui.collections.borrow()[2].review_finish(Ok(Page::complete(
+    ui.collections.borrow()[1].review_finish(Ok(Page::complete(
         (0..12)
             .map(|i| {
                 let mut p = post();
@@ -173,7 +173,7 @@ fn rendered_review() {
     capture(&window, "reels-narrow");
     window.set_default_size(1100, 820);
     capture(&window, "reels-wide");
-    let reels = ui.collections.borrow()[2].clone();
+    let reels = ui.collections.borrow()[1].clone();
     let widgets = descendants(reels.root.upcast_ref());
     let details = widgets
         .iter()
@@ -284,7 +284,7 @@ fn rendered_review() {
     }));
     window.set_default_size(360, 700);
     ui.destinations.set_visible_child_name("messages");
-    ui.collections.borrow()[3].review_finish(Ok(Page::complete(vec![Item::Conversation(
+    ui.collections.borrow()[2].review_finish(Ok(Page::complete(vec![Item::Conversation(
         Conversation {
             id: "5".into(),
             title: "Alex Morgan".into(),
@@ -298,7 +298,7 @@ fn rendered_review() {
     capture(&window, "inbox-narrow");
     window.set_default_size(1100, 820);
     capture(&window, "inbox-wide");
-    let inbox = ui.collections.borrow()[3].clone();
+    let inbox = ui.collections.borrow()[2].clone();
     inbox.review_open_thread();
     capture(&window, "inbox-selected-wide");
     window.set_default_size(360, 700);
@@ -342,6 +342,7 @@ fn rendered_review() {
     for (route, items, name) in [
         (Route::Comments(post()), vec![Item::Comment(Comment { id: "comment".into(), author: user(), liked: true, likes: 12, text: "A longer comment that should wrap naturally and remain fully readable at the minimum window size.".into() })], "comments-minimum"),
         (Route::Followers(user(), false), vec![Item::User(user())], "followers-minimum"),
+        (Route::Followers(user(), true), vec![Item::User(user()), Item::User(User { id: "7".into(), username: "sam".into(), ..User::default() })], "following-minimum"),
         (Route::Stories, vec![Item::Story(Story { id: "story".into(), author: user(), seen: false })], "stories-minimum"),
         (Route::Notifications, vec![Item::Notification(Notification { id: "notification".into(), text: "Alex Morgan and other people liked your photo.".into(), user: Some(user()) })], "notifications-minimum"),
     ] {
@@ -366,6 +367,45 @@ fn rendered_review() {
     })])));
     window.set_default_size(1100, 820);
     capture(&window, "notifications-wide");
+    let bell = descendants(window.upcast_ref())
+        .into_iter()
+        .find_map(|w| {
+            w.downcast::<gtk::MenuButton>()
+                .ok()
+                .filter(|b| b.tooltip_text().as_deref() == Some("Notifications") && b.is_mapped())
+        })
+        .unwrap();
+    bell.popup();
+    settle();
+    let popover = bell.popover().unwrap();
+    assert!(popover.is_visible());
+    let panel = ui
+        .notifications
+        .borrow()
+        .iter()
+        .filter_map(|weak| weak.upgrade())
+        .find(|c| {
+            popover
+                .child()
+                .is_some_and(|child| c.root.is_ancestor(&child))
+        })
+        .unwrap();
+    panel.review_finish(Ok(Page::complete(vec![Item::Notification(Notification {
+        id: "popover".into(),
+        text: "Alex Morgan liked your photo.".into(),
+        user: Some(user()),
+    })])));
+    for _ in 0..10 {
+        if panel.root.is_mapped() {
+            break;
+        }
+        settle();
+    }
+    assert!(descendants(popover.upcast_ref()).iter().any(|w| {
+        w.downcast_ref::<gtk::Label>()
+            .is_some_and(|l| l.label() == "Alex Morgan liked your photo.")
+    }));
+    bell.popdown();
     for (route, items, name) in [
         (
             Route::Search("alex".into()),
@@ -684,18 +724,43 @@ fn messages_review() {
     window.set_default_size(1100, 820);
     capture(&window, "messages-media-wide");
     let widgets = descendants(inbox.root.upcast_ref());
+    // Off-screen rows keep stale divider flags (their tick callback only runs
+    // while mapped), so only dividers in the viewport are authoritative.
     assert_eq!(
         widgets
             .iter()
-            .filter(|w| w.has_css_class("message-divider") && w.is_visible())
+            .filter(|w| { w.has_css_class("message-divider") && w.is_visible() && w.is_mapped() })
             .count(),
-        2
+        1
     );
     assert!(
         widgets
             .iter()
             .any(|w| w.has_css_class("message-bubble") && w.has_css_class("join-previous"))
     );
+    for class in [
+        "message-reactions",
+        "message-quote",
+        "post-share",
+        "message-sticker",
+        "voice-card",
+        "link-card",
+        "reply-bar",
+        "video-badge",
+    ] {
+        assert!(
+            widgets.iter().any(|w| w.has_css_class(class)),
+            "missing rendered {class}"
+        );
+    }
+    assert!(widgets.iter().any(|w| {
+        w.downcast_ref::<gtk::Label>()
+            .is_some_and(|l| l.label() == "Replying to @alex_photography")
+    }));
+    assert!(widgets.iter().any(|w| {
+        w.downcast_ref::<gtk::MenuButton>()
+            .is_some_and(|b| b.tooltip_text().as_deref() == Some("Send a sticker"))
+    }));
     window.set_default_size(360, 700);
     settle();
     assert!(inbox.back());

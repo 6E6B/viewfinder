@@ -5,6 +5,16 @@ use std::{cell::Cell, rc::Rc};
 
 /// Feed videos share the application's single decoder with the viewer and reels.
 pub(super) fn new(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
+    build(ui, media, false)
+}
+
+/// Message-sized videos swap the corner toolbar for a centered play badge so
+/// the small surface stays uncluttered.
+pub(super) fn message(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
+    build(ui, media, true)
+}
+
+fn build(ui: &Rc<Ui>, media: &Media, compact: bool) -> gtk::Widget {
     let surface = gtk::Overlay::new();
     surface.add_css_class("reel-surface");
     surface.set_overflow(gtk::Overflow::Hidden);
@@ -22,13 +32,6 @@ pub(super) fn new(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
     status.set_visible(false);
     status.connect_label_notify(|s| s.set_visible(!s.label().is_empty()));
     surface.add_overlay(&status);
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    controls.set_halign(gtk::Align::End);
-    controls.set_valign(gtk::Align::End);
-    controls.set_margin_end(12);
-    controls.set_margin_bottom(12);
-    controls.add_css_class("osd");
-    controls.add_css_class("toolbar");
     let play = icon_button("media-playback-start-symbolic", "Play video");
     let paused = Rc::new(Cell::new(true));
     let url = media.video.clone().unwrap_or_default();
@@ -66,9 +69,29 @@ pub(super) fn new(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
             } else {
                 "Pause video"
             }));
+            // A paused clip shows its badge again; a playing one stays clean —
+            // tapping the picture itself pauses.
+            if compact {
+                button.set_visible(paused.get());
+            }
         }
     ));
-    controls.append(&play);
+    if compact {
+        play.add_css_class("video-badge");
+        play.set_halign(gtk::Align::Center);
+        play.set_valign(gtk::Align::Center);
+        surface.add_overlay(&play);
+    }
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    controls.set_halign(gtk::Align::End);
+    controls.set_valign(gtk::Align::End);
+    controls.set_margin_end(12);
+    controls.set_margin_bottom(12);
+    controls.add_css_class("osd");
+    controls.add_css_class("toolbar");
+    if !compact {
+        controls.append(&play);
+    }
     let mute = icon_button("audio-volume-muted-symbolic", "Toggle audio");
     mute.connect_clicked(glib::clone!(
         #[weak]
@@ -126,6 +149,7 @@ pub(super) fn new(ui: &Rc<Ui>, media: &Media) -> gtk::Widget {
                 surface.set_child(Some(&preview));
                 play.set_icon_name("media-playback-start-symbolic");
                 play.set_tooltip_text(Some("Play video"));
+                play.set_visible(true);
             }
         }
     ));

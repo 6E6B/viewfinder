@@ -174,7 +174,7 @@ impl Reels {
             move |_| {
                 r.autoplay.set(false);
                 if let Some(ui) = r.ui.upgrade() {
-                    ui.playback.stop();
+                    ui.playback.stop_owned(&r.root);
                 }
             }
         ));
@@ -235,7 +235,7 @@ impl Reels {
         self.stage.set_widget_name(&post.id);
         self.play.borrow_mut().take();
         if self.root.is_mapped() {
-            ui.playback.stop();
+            ui.playback.stop_owned(&self.root);
         }
         while let Some(child) = self.stage.first_child() {
             self.stage.remove(&child);

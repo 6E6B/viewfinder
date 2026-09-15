@@ -27,7 +27,7 @@ pub fn array(v: &Value) -> Result<&Vec<Value>, Error> {
         Error::Protocol
     })
 }
-fn optional(v: &Value) -> Option<String> {
+pub fn optional(v: &Value) -> Option<String> {
     let s = string(v);
     (!s.is_empty()).then_some(s)
 }
@@ -63,10 +63,11 @@ pub fn media(v: &Value) -> Media {
         .map(|a| a.iter().filter(|i| optional(&i["url"]).is_some()).collect())
         .unwrap_or_default();
     images.sort_by_key(|i| i["width"].as_i64().unwrap_or(0));
-    let thumbnail = images
+    let preview_candidate = images
         .iter()
         .find(|i| i["width"].as_i64().unwrap_or(0) >= 320)
-        .or_else(|| images.last())
+        .or_else(|| images.last());
+    let thumbnail = preview_candidate
         .and_then(|i| optional(&i["url"]))
         .or_else(|| optional(&v["thumbnail_src"]))
         .or_else(|| optional(&v["display_url"]));
@@ -76,20 +77,29 @@ pub fn media(v: &Value) -> Media {
         .or_else(|| images.last())
         .and_then(|i| optional(&i["url"]))
         .or_else(|| optional(&v["display_url"]));
+    // Frames reserve space by aspect ratio; use the rendered candidate's own
+    // dimensions so the surface never letterboxes around a mismatched image.
+    let candidate_dims = preview_candidate
+        .and_then(|i| i["width"].as_i64().zip(i["height"].as_i64()))
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    let (width, height) = candidate_dims.unwrap_or_else(|| {
+        (
+            v["original_width"]
+                .as_i64()
+                .or_else(|| v["dimensions"]["width"].as_i64())
+                .unwrap_or(1),
+            v["original_height"]
+                .as_i64()
+                .or_else(|| v["dimensions"]["height"].as_i64())
+                .unwrap_or(1),
+        )
+    });
     Media {
         thumbnail,
         image,
         video: video_url(v),
-        width: v["original_width"]
-            .as_i64()
-            .or_else(|| v["dimensions"]["width"].as_i64())
-            .unwrap_or(1)
-            .clamp(1, 10000) as i32,
-        height: v["original_height"]
-            .as_i64()
-            .or_else(|| v["dimensions"]["height"].as_i64())
-            .unwrap_or(1)
-            .clamp(1, 10000) as i32,
+        width: width.clamp(1, 10000) as i32,
+        height: height.clamp(1, 10000) as i32,
     }
 }
 
@@ -120,8 +130,36 @@ fn video_url(v: &Value) -> Option<String> {
         })
         .or_else(|| optional(&v["video_url"]))
 }
+/// Direct share wrappers nest the media object inconsistently; descend until a
+/// node carrying media fields or an identifier is found.
+fn share_target(v: &Value) -> &Value {
+    let mut node = v;
+    loop {
+        let looks_like_media = node.get("pk").is_some()
+            || node.get("id").is_some()
+            || node.get("media_id").is_some()
+            || node.get("code").is_some()
+            || node["image_versions2"].is_object();
+        if looks_like_media {
+            return node;
+        }
+        let inner = ["media", "item", "clip", "video"].iter().find_map(|key| {
+            let child = &node[key];
+            child.is_object().then_some(child)
+        });
+        match inner {
+            Some(child) => node = child,
+            None => return node,
+        }
+    }
+}
+
 pub fn post(v: &Value) -> Result<Post, Error> {
-    let v = v.get("media_or_ad").or_else(|| v.get("media")).unwrap_or(v);
+    let v = v
+        .get("media_or_ad")
+        .or_else(|| v.get("media"))
+        .or_else(|| v.get("item"))
+        .unwrap_or(v);
     let media = if let Some(items) = v["carousel_media"].as_array() {
         items.iter().map(media).collect()
     } else if let Some(edges) = v["edge_sidecar_to_children"]["edges"].as_array() {
@@ -130,7 +168,14 @@ pub fn post(v: &Value) -> Result<Post, Error> {
         vec![media(v)]
     };
     Ok(Post {
-        id: required(v.get("pk").or_else(|| v.get("id")).unwrap_or(&Value::Null))?,
+        id: required(
+            v.get("pk")
+                .or_else(|| v.get("id"))
+                .or_else(|| v.get("media_id"))
+                .or_else(|| v.get("code"))
+                .or_else(|| v.get("shortcode"))
+                .unwrap_or(&Value::Null),
+        )?,
         code: string(
             v.get("code")
                 .or_else(|| v.get("shortcode"))
@@ -207,7 +252,7 @@ pub fn conversation(v: &Value) -> Result<Conversation, Error> {
     Ok(Conversation {
         id: required(&v["thread_id"])?,
         thread_fbid: v["thread_fbid"].as_str().map(str::to_owned),
-        unread: v["marked_as_unread"].as_bool().unwrap_or(false),
+        unread: v["marked_as_unread"].as_bool().unwrap_or(false) || unseen(v),
         title: string(&v["thread_title"]),
         participants: array(&v["users"])?
             .iter()
@@ -217,6 +262,26 @@ pub fn conversation(v: &Value) -> Result<Conversation, Error> {
         preview_sender: string(&v["items"][0]["user_id"]),
         preview_timestamp: v["items"][0]["timestamp"].as_i64().unwrap_or(0),
     })
+}
+/// REST threads carry per-participant `last_seen_at` item markers: the viewer
+/// is behind when their marker is absent or predates the newest item.
+fn unseen(v: &Value) -> bool {
+    let viewer = string(&v["viewer_id"]);
+    if viewer.is_empty() || !v["last_seen_at"].is_object() {
+        return false;
+    }
+    let item = if v["last_permanent_item"]["item_id"].is_string() {
+        &v["last_permanent_item"]
+    } else {
+        &v["items"][0]
+    };
+    let Some(item_id) = item["item_id"].as_str() else {
+        return false;
+    };
+    if string(&item["user_id"]) == viewer {
+        return false;
+    }
+    v["last_seen_at"][viewer.as_str()]["item_id"].as_str() != Some(item_id)
 }
 fn message_preview(v: &Value) -> String {
     let text = string(&v["text"]);
@@ -256,6 +321,7 @@ fn message_preview(v: &Value) -> String {
             }
         }
         "animated_media" => "GIF".into(),
+        "sticker" => "Sticker".into(),
         "voice_media" => "Voice message".into(),
         "story_share" | "reel_share" => "Shared story".into(),
         "link" => {
@@ -286,6 +352,169 @@ fn collect_message_media(value: &Value, attachments: &mut Vec<Attachment>) {
     }
 }
 
+/// Sticker and animated-media items carry renditions under `images` (or flat
+/// fields); pick the best displayable URL and the mp4 when present.
+fn animated_media(value: &Value) -> Option<Media> {
+    let images = &value["images"];
+    let rendition = images
+        .get("fixed_height")
+        .or_else(|| images.get("original"))
+        .unwrap_or(value);
+    let image = optional(&rendition["webp"])
+        .or_else(|| optional(&rendition["url"]))
+        .or_else(|| optional(&value["url"]));
+    let video = optional(&rendition["mp4"]);
+    if image.is_none() && video.is_none() {
+        return None;
+    }
+    Some(Media {
+        thumbnail: image.clone(),
+        image,
+        video,
+        width: string(&rendition["width"]).parse().unwrap_or(200),
+        height: string(&rendition["height"]).parse().unwrap_or(200),
+    })
+}
+
+/// Tray stickers report `animated_info` whose rendition layout varies between
+/// packs. Scan shallowly for the first node carrying a displayable URL.
+pub fn sticker_media(v: &Value) -> Option<Media> {
+    fn number(v: &Value) -> Option<i32> {
+        v.as_i64()
+            .or_else(|| string(v).parse().ok())
+            .map(|n| n.clamp(1, 10000) as i32)
+    }
+    fn scan(v: &Value, depth: u8) -> Option<Media> {
+        if depth > 4 {
+            return None;
+        }
+        if let Some(object) = v.as_object() {
+            let video = optional(&object["mp4"])
+                .or_else(|| optional(&object["animation"]))
+                .or_else(|| {
+                    object["animation"]
+                        .as_object()
+                        .and_then(|a| optional(&a["uri"]).or_else(|| optional(&a["url"])))
+                });
+            let image = optional(&object["webp"])
+                .or_else(|| optional(&object["url"]))
+                .or_else(|| optional(&object["uri"]))
+                .or_else(|| optional(&object["preview"]))
+                .or_else(|| optional(&object["preview_url"]));
+            if video.is_some() || image.is_some() {
+                return Some(Media {
+                    thumbnail: image.clone(),
+                    image,
+                    video,
+                    width: number(&object["width"]).unwrap_or(200),
+                    height: number(&object["height"]).unwrap_or(200),
+                });
+            }
+            for child in object.values() {
+                if let Some(media) = scan(child, depth + 1) {
+                    return Some(media);
+                }
+            }
+        } else if let Some(items) = v.as_array() {
+            for item in items {
+                if let Some(media) = scan(item, depth + 1) {
+                    return Some(media);
+                }
+            }
+        }
+        None
+    }
+    scan(v, 0)
+}
+
+/// A reply's quoted item is a partial thread item; summarize it the same way
+/// inbox previews do, with the text body preferred when present.
+fn quoted(v: &Value) -> Option<QuotedMessage> {
+    let q = v.get("replied_to_message")?;
+    if q.is_null() {
+        return None;
+    }
+    let summary = optional(&q["text"]).unwrap_or_else(|| {
+        let preview = message_preview(q);
+        if preview.is_empty() {
+            "Message".into()
+        } else {
+            preview
+        }
+    });
+    let mut thumbnails = Vec::new();
+    let qkind = q["item_type"].as_str().unwrap_or("");
+    match qkind {
+        "media" => collect_message_media(&q["media"], &mut thumbnails),
+        "visual_media" | "raven_media" | "story_share" | "reel_share" => {
+            collect_message_media(&q[qkind]["media"], &mut thumbnails)
+        }
+        "media_share" | "clip" | "felix_share" => {
+            let value = match qkind {
+                "clip" => &q["clip"]["clip"],
+                "felix_share" => &q["felix_share"]["video"],
+                _ => &q["media_share"],
+            };
+            collect_message_media(value, &mut thumbnails);
+        }
+        "animated_media" | "sticker" => {
+            if let Some(media) = animated_media(&q[qkind]) {
+                thumbnails.push(Attachment::Media(media));
+            }
+        }
+        _ => (),
+    }
+    let thumbnail = thumbnails.into_iter().find_map(|a| match a {
+        Attachment::Media(media) => Some(media),
+        _ => None,
+    });
+    Some(QuotedMessage {
+        id: string(&q["item_id"]),
+        sender: string(&q["user_id"]),
+        summary,
+        thumbnail,
+    })
+}
+
+/// Items carry `reactions.emojis` and `reactions.likes` lists keyed by sender.
+/// Likes render as a heart reaction.
+fn reactions(v: &Value) -> Vec<Reaction> {
+    let timestamp = |r: &Value| {
+        r["timestamp"]
+            .as_i64()
+            .or_else(|| string(&r["timestamp"]).parse().ok())
+            .unwrap_or(0)
+    };
+    let mut out = Vec::new();
+    if let Some(emojis) = v["reactions"]["emojis"].as_array() {
+        for entry in emojis {
+            let emoji = string(&entry["emoji"]);
+            let sender = string(&entry["sender_id"]);
+            if !emoji.is_empty() && !sender.is_empty() {
+                out.push(Reaction {
+                    emoji,
+                    sender,
+                    timestamp: timestamp(entry),
+                });
+            }
+        }
+    }
+    if let Some(likes) = v["reactions"]["likes"].as_array() {
+        for entry in likes {
+            let sender = string(&entry["sender_id"]);
+            if !sender.is_empty() {
+                out.push(Reaction {
+                    emoji: "♥".into(),
+                    sender,
+                    timestamp: timestamp(entry),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|r| r.timestamp);
+    out
+}
+
 pub fn message(v: &Value) -> Result<Message, Error> {
     let mut attachments = Vec::new();
     let kind = v["item_type"].as_str().unwrap_or("");
@@ -306,32 +535,32 @@ pub fn message(v: &Value) -> Result<Message, Error> {
                 "felix_share" => &v["felix_share"]["video"],
                 _ => &v["media_share"],
             };
+            let value = share_target(value);
             if let Ok(post) = post(value) {
                 attachments.push(Attachment::Post(Box::new(post)));
             } else {
                 collect_message_media(value, &mut attachments);
             }
         }
-        "story_share" | "reel_share" => collect_message_media(&v[kind]["media"], &mut attachments),
+        "story_share" | "reel_share" => {
+            let value = share_target(&v[kind]["media"]);
+            // Shared stories are full media objects; render as a post card when
+            // author and id survive normalization.
+            if let Ok(post) = post(value) {
+                attachments.push(Attachment::Post(Box::new(post)));
+            } else {
+                collect_message_media(value, &mut attachments);
+            }
+        }
         "animated_media" | "sticker" => {
             let value = &v[kind];
-            let images = &value["images"];
-            let rendition = images
-                .get("fixed_height")
-                .or_else(|| images.get("original"))
-                .unwrap_or(value);
-            let image = optional(&rendition["webp"])
-                .or_else(|| optional(&rendition["url"]))
-                .or_else(|| optional(&value["url"]));
-            let video = optional(&rendition["mp4"]);
-            if image.is_some() || video.is_some() {
-                attachments.push(Attachment::Media(Media {
-                    thumbnail: image.clone(),
-                    image,
-                    video,
-                    width: string(&rendition["width"]).parse().unwrap_or(200),
-                    height: string(&rendition["height"]).parse().unwrap_or(200),
-                }));
+            if let Some(media) = animated_media(value) {
+                attachments.push(Attachment::Animated {
+                    media,
+                    alt: optional(&value["alt_text"])
+                        .or_else(|| optional(&value["sticker_alt_text"]))
+                        .unwrap_or_default(),
+                });
             } else {
                 collect_message_media(value, &mut attachments);
             }
@@ -339,7 +568,46 @@ pub fn message(v: &Value) -> Result<Message, Error> {
         "link" => attachments.push(Attachment::Link {
             title: string(&v["link"]["link_context"]["link_title"]),
             url: string(&v["link"]["link_context"]["link_url"]),
+            image_url: optional(&v["link"]["link_context"]["link_image_url"]),
         }),
+        "voice_media" => {
+            let audio = &v["voice_media"]["media"]["audio"];
+            let url = audio["audio_urls"]
+                .as_array()
+                .and_then(|urls| {
+                    urls.iter()
+                        .find_map(|u| optional(u).or_else(|| optional(&u["url"])))
+                })
+                .or_else(|| optional(&audio["audio_url"]));
+            if let Some(url) = url {
+                let media = &v["voice_media"]["media"];
+                let duration_ms = media["voice_duration_ms"]
+                    .as_i64()
+                    .or_else(|| audio["duration"].as_f64().map(|s| (s * 1000.0) as i64))
+                    .or_else(|| {
+                        let samples = audio["waveform_data"].as_array()?.len() as i64;
+                        let hz = audio["waveform_sampling_frequency_hz"].as_i64()?;
+                        (hz > 0).then_some(samples * 1000 / hz)
+                    })
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let waveform = audio["waveform_data"]
+                    .as_array()
+                    .map(|data| {
+                        data.iter()
+                            .filter_map(|w| w.as_f64().map(|w| w as f32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                attachments.push(Attachment::Voice {
+                    url,
+                    duration_ms,
+                    waveform,
+                });
+            } else {
+                attachments.push(Attachment::Unavailable);
+            }
+        }
         _ => attachments.push(Attachment::Unavailable),
     }
     if attachments.is_empty() && !matches!(kind, "text" | "like") {
@@ -360,6 +628,8 @@ pub fn message(v: &Value) -> Result<Message, Error> {
         },
         timestamp: v["timestamp"].as_i64().unwrap_or(0),
         attachments,
+        reply_to: quoted(v),
+        reactions: reactions(v),
     })
 }
 
@@ -393,9 +663,9 @@ mod tests {
         assert!(matches!(&parsed.attachments[1], Attachment::Media(m) if m.video.is_some()));
         for kind in ["animated_media", "sticker"] {
             let mut value = json!({"item_id":"1", "user_id":"2", "item_type":kind});
-            value[kind] = json!({"images":{"fixed_height":{"url":"https://example.com/sticker.gif", "mp4":"https://example.com/sticker.mp4", "width":"200", "height":"100"}}});
+            value[kind] = json!({"images":{"fixed_height":{"url":"https://example.com/sticker.gif", "mp4":"https://example.com/sticker.mp4", "width":"200", "height":"100"}}, "alt_text":"cat sticker"});
             assert!(
-                matches!(&message(&value).unwrap().attachments[0], Attachment::Media(m) if m.video.is_some() && m.height == 100)
+                matches!(&message(&value).unwrap().attachments[0], Attachment::Animated{media:m, alt} if m.video.is_some() && m.height == 100 && alt == "cat sticker")
             );
         }
         for kind in ["media_share", "clip", "felix_share", "raven_media"] {
@@ -410,6 +680,64 @@ mod tests {
             json!({"item_id":"1", "user_id":"2", "item_type":"media_share", "media_share":post});
         assert!(
             matches!(&message(&value).unwrap().attachments[0], Attachment::Post(p) if p.media.len() == 2)
+        );
+        // Shared stories render as post cards when the media carries an author.
+        let story = json!({"pk":"5", "user":{"pk":"4","username":"alex"}, "image_versions2":{"candidates":[{"url":"https://example.com/s.jpg","width":400}]}});
+        let value = json!({"item_id":"1", "user_id":"2", "item_type":"story_share", "story_share":{"media":story}});
+        assert!(matches!(
+            message(&value).unwrap().attachments[0],
+            Attachment::Post(_)
+        ));
+        let value = json!({"item_id":"1", "user_id":"2", "item_type":"story_share", "story_share":{"media":{"image_versions2":{"candidates":[{"url":"https://example.com/s.jpg","width":400}]}}}});
+        assert!(matches!(
+            message(&value).unwrap().attachments[0],
+            Attachment::Media(_)
+        ));
+    }
+
+    #[test]
+    fn dm_reactions_replies_voice_and_link_images_normalize() {
+        let image = json!({"image_versions2":{"candidates":[{"url":"https://example.com/photo.jpg", "width":400}]}});
+        let value = json!({
+            "item_id":"10", "user_id":"2", "item_type":"text", "text":"hello",
+            "reactions": {
+                "emojis": [{"sender_id":42, "emoji":"😂", "timestamp":"1788800000000000"}],
+                "likes": [{"sender_id":7, "timestamp":1788800001000000_i64}]
+            },
+            "replied_to_message": {
+                "item_id":"9", "user_id":3, "item_type":"media", "media":image
+            }
+        });
+        let parsed = message(&value).unwrap();
+        assert_eq!(parsed.reactions.len(), 2);
+        assert_eq!(parsed.reactions[0].emoji, "😂");
+        assert_eq!(parsed.reactions[0].sender, "42");
+        assert_eq!(parsed.reactions[1].emoji, "♥");
+        let quote = parsed.reply_to.unwrap();
+        assert_eq!(quote.id, "9");
+        assert_eq!(quote.sender, "3");
+        assert_eq!(quote.summary, "1 Image");
+        assert!(quote.thumbnail.is_some());
+        let value = json!({
+            "item_id":"10", "user_id":"2", "item_type":"text", "text":"same",
+            "replied_to_message": {"item_id":"8", "user_id":3, "item_type":"text", "text":"earlier"}
+        });
+        let quote = message(&value).unwrap().reply_to.unwrap();
+        assert_eq!(quote.summary, "earlier");
+        assert!(quote.thumbnail.is_none());
+        let value = json!({"item_id":"11", "user_id":"2", "item_type":"voice_media",
+        "voice_media":{"media":{"voice_duration_ms":4200,"audio":{
+            "audio_urls":[{"url":"https://example.com/voice.m4a"}],
+            "waveform_data":[0.1, 0.9, 0.4],
+            "waveform_sampling_frequency_hz":50
+        }}}});
+        assert!(
+            matches!(&message(&value).unwrap().attachments[0], Attachment::Voice{url, duration_ms: 4200, waveform} if url == "https://example.com/voice.m4a" && waveform.len() == 3)
+        );
+        let value = json!({"item_id":"12", "user_id":"2", "item_type":"link",
+            "link":{"link_context":{"link_title":"A page","link_url":"https://example.com","link_image_url":"https://example.com/i.jpg"}}});
+        assert!(
+            matches!(&message(&value).unwrap().attachments[0], Attachment::Link{image_url, ..} if image_url.as_deref() == Some("https://example.com/i.jpg"))
         );
     }
 
@@ -449,6 +777,46 @@ mod tests {
             assert_eq!(thread.preview_timestamp, 1788800000000000);
         }
         assert_eq!(message_preview(&Value::Null), "");
+    }
+    #[test]
+    fn conversation_unread_uses_last_seen_marker() {
+        let thread = |seen: &str| {
+            conversation(&json!({
+                "thread_id":"1", "viewer_id": 7, "users":[],
+                "last_permanent_item": {"item_id":"m2", "user_id": 9},
+                "last_seen_at": {"7": {"item_id": seen}},
+                "items": [{"item_id":"m2", "user_id": 9, "item_type":"text"}]
+            }))
+            .unwrap()
+            .unread
+        };
+        assert!(thread("m1"));
+        assert!(!thread("m2"));
+        assert!(
+            conversation(&json!({
+                "thread_id":"1", "viewer_id": 7, "users":[],
+                "last_permanent_item": {"item_id":"m2", "user_id": 9},
+                "last_seen_at": {"9": {"item_id": "m2"}},
+                "items": []
+            }))
+            .unwrap()
+            .unread
+        );
+        assert!(
+            !conversation(&json!({
+                "thread_id":"1", "viewer_id": 7, "users":[],
+                "last_permanent_item": {"item_id":"m2", "user_id": 7},
+                "last_seen_at": {},
+                "items": []
+            }))
+            .unwrap()
+            .unread
+        );
+        assert!(
+            !conversation(&json!({"thread_id":"1", "users":[], "items": []}))
+                .unwrap()
+                .unread
+        );
     }
     #[test]
     fn video_renditions_balance_resolution_and_transfer_size() {
